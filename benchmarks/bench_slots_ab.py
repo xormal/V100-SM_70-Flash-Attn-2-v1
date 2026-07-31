@@ -135,6 +135,10 @@ def main():
         vf = (torch.randn(1, Hkv, Sk, D, device="cuda", dtype=torch.float16) * 0.4).contiguous()
         kb = kf.to(torch.float8_e5m2).view(torch.uint8).contiguous()
         vb = vf.to(torch.float8_e5m2).view(torch.uint8).contiguous()
+        # e4m3 -- ТОТ ЖЕ байтовый транспорт и ТА ЖЕ машинерия масштабов, что у e5m2 (холостая 1.f),
+        # поэтому пара 1/11 меряет РОВНО цену разворота и ничего кроме неё.
+        k4 = kf.to(torch.float8_e4m3fn).view(torch.uint8).contiguous()
+        v4 = vf.to(torch.float8_e4m3fn).view(torch.uint8).contiguous()
         kq, ks = quant_pertoken(kf)
         vq, vs = quant_pertoken(vf)
         kqb, vqb = to_biased(kq), to_biased(vq)
@@ -160,6 +164,11 @@ def main():
                 return lambda: pext.attn_fwd_volta_i8(qw, kcb, empty, vcb, empty, sc, True, c)
             if f in (8, 9, 10):
                 return lambda: pext.attn_fwd_volta_i8(q, kqb, ksv, vqb, ksv, sc, True, c)
+            if f in (11, 12, 13):
+                # 11 -- боевой e4m3 (6 инстр./4 Б); 12 -- ФАЛЬСИФИКАТОР (разворот снят, ответ
+                # неверен, меряется ДОЛЯ фазы); 13 -- тот же ответ прежней записью (8 инстр.).
+                return lambda: pext.attn_fwd_volta_i8(q, k4.view(torch.int8), empty,
+                                                      v4.view(torch.int8), empty, sc, True, c)
             raise SystemExit(f"неизвестный код {c}")
 
         fns = {str(c): mk(c) for c in codes}
@@ -178,7 +187,7 @@ def main():
                 print(f"      ф{c}: torch.equal к базе = {torch.equal(o, base)}   "
                       f"relL2 к базе = {relL2(o, base):.3e}   relL2 к fp32 = {relL2(o, ref):.4e}")
 
-        del q, kf, vf, kb, vb, kq, ks, vq, vs, kqb, vqb, ksv, kc, kcs, vc, vcs, kcb, vcb, qw
+        del q, kf, vf, kb, vb, kq, ks, vq, vs, kqb, vqb, ksv, kc, kcs, vc, vcs, kcb, vcb, qw, k4, v4
         torch.cuda.empty_cache()
 
     n1, cl1 = cards_state(card)

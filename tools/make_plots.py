@@ -40,9 +40,10 @@ LANG = {
         share="share of kernel time, %",
         t_phase="What the byte-KV kernel spends its time on\n(one phase removed per build; only the time is read)",
         ph_note="same tensor work,\nsame aux issues,\n1.78× the time",
-        pred="predicted: 1 slot = 1 cycle", meas="measured", extra_t="extra time, %",
-        roles="where the idle instruction was added", role_c="computing warps", role_h="hauling warps",
-        t_slots="What an extra issue slot costs\n(idle instruction, same answer)",
+        extra_t="extra time, %", slot_names=["count model\n(1 slot = 1 cycle)", "idle\ninstruction",
+                                             "same count,\non the chain"],
+        roles="+128 issues per computing warp",
+        t_slots="What an extra issue actually costs\nthe number under each bar = cycles per slot",
     ),
     "ru": dict(
         ctx="контекст, токенов", us_step="мкс на шаг декода", rel_uu="время / время при UU=2",
@@ -63,9 +64,10 @@ LANG = {
         share="доля времени ядра, %",
         t_phase="На что байтовое ядро тратит время\n(в каждой сборке снята одна фаза; читается только время)",
         ph_note="та же тензорная работа,\nто же число выдач,\nв 1.78 раза дольше",
-        pred="предсказано: слот = такт", meas="замерено", extra_t="прирост времени, %",
-        roles="куда добавлена холостая команда", role_c="считающие варпы", role_h="везущие варпы",
-        t_slots="Сколько стоит слот выдачи\n(холостая команда, ответ тот же)",
+        extra_t="прирост времени, %", slot_names=["модель счёта\n(слот = такт)", "холостая\nкоманда",
+                                                  "тот же счёт,\nно в цепи"],
+        roles="+128 выдач на считающий варп",
+        t_slots="Сколько на самом деле стоит выдача\nчисло под столбиком = тактов на слот",
     ),
 }
 
@@ -106,9 +108,16 @@ D256 = [("1,32,2048", 1.815, 2.798, 2.813), ("1,16,4096", 3.357, 6.194, 6.230),
 #    Left panel: share of time per phase. Right panel: what an extra issue actually costs.
 PHASES = [("gemm1", 35.1), ("gemm2", 19.7), ("softmax", 15.2), ("feed", 5.7), ("rdv", 2.0),
           ("rest", 22.3)]
-#    (role, extra slots %, measured extra time %) -- the idle-instruction falsifier (LOP3, zero mask
-#    from constant memory, bit-identical answer). Price per slot = time% / slots%.
-SLOT_PRICE = [("compute", 8.7, 1.93), ("haul", 2.2, 0.65)]
+#    THE PRICE OF A SLOT IS NOT ONE NUMBER -- IT DEPENDS ON WHERE THE INSTRUCTION SITS.
+#    Both rows below add the SAME +128 issues per computing warp and were reproduced independently:
+#      * idle    -- a dead LOP3 pair (zero mask from constant memory), nothing waits on it: +1.93%
+#                   (re-measured 2026-07-31 across Sk 8K/32K/128K: +2.10 / +1.92 / +1.89%)
+#      * on-chain-- the real sign XOR of the byte expansion, on the dependency chain feeding the
+#                   tensor op (formats 0 vs 6, differing by exactly that instruction): +4.24%
+#                   (re-measured: +4.09 / +4.33 / +4.45%)
+#    A count-based model ("1 slot = 1 cycle") predicts +8.7% for both. Ratio on-chain/idle = 2.2x.
+#    (label, predicted extra time %, measured extra time %)
+SLOT_PRICE = [("predicted", 8.7, 8.7), ("idle", 8.7, 1.93), ("on chain", 8.7, 4.24)]
 
 
 def emit(lang):
@@ -195,14 +204,14 @@ def emit(lang):
                  fontsize=7.5, color="#c0392b")
 
     i = range(len(SLOT_PRICE))
-    axr.bar([x - 0.19 for x in i], [p[1] for p in SLOT_PRICE], 0.38, label=T["pred"], color="#bdc3c7")
-    axr.bar([x + 0.19 for x in i], [p[2] for p in SLOT_PRICE], 0.38, label=T["meas"], color="#c0392b")
+    cols2 = ["#bdc3c7", "#7f8c8d", "#c0392b"]
+    axr.bar(list(i), [p[2] for p in SLOT_PRICE], 0.55, color=cols2)
     for x, p in zip(i, SLOT_PRICE):
-        axr.annotate(f"{p[2]/p[1]:.2f}", (x + 0.19, p[2]), xytext=(0, 3), textcoords="offset points",
-                     ha="center", fontsize=8.5, color="#c0392b")
-    axr.set_xticks(list(i)); axr.set_xticklabels([T["role_c"], T["role_h"]], fontsize=8.5)
+        axr.annotate(f"{p[2]/p[1]:.2f}", (x, p[2]), xytext=(0, 3), textcoords="offset points",
+                     ha="center", fontsize=9, color="#333")
+    axr.set_xticks(list(i)); axr.set_xticklabels(T["slot_names"], fontsize=8.5)
     axr.set_ylabel(T["extra_t"]); axr.set_xlabel(T["roles"], fontsize=8.5)
-    axr.set_title(T["t_slots"], fontsize=9.5); axr.legend(frameon=False, fontsize=8)
+    axr.set_title(T["t_slots"], fontsize=9.5)
     fig.tight_layout(); fig.savefig(os.path.join(out, "binding_resource.png")); plt.close(fig)
 
     return sorted(os.listdir(out))

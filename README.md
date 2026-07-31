@@ -70,7 +70,7 @@ running. The middle column is what stock vLLM/PyTorch does on this hardware.
 | **paged KV + varlen** | — | block table, `cu_seqlens` |
 | **GQA/MQA** | K/V expansion | native, no expansion |
 
-**19/19** correctness suites pass on V100 (`tests/run_all.py`); every kernel is checked against an
+**20/20** correctness suites pass on V100 (`tests/run_all.py`); every kernel is checked against an
 fp32 oracle.
 
 ---
@@ -421,9 +421,9 @@ no block-order reversal → 3.988. Off-switch: `FA2SM70_NO_VOLTA_FWD=1`.
 Every claim above is reproducible on your own V100:
 
 ```bash
-python tests/run_all.py            # full GPU matrix: 19 correctness suites, prints pass/fail (19/19 on V100)
+python tests/run_all.py            # full GPU matrix: 20 correctness suites, prints pass/fail (20/20 on V100)
 python tests/test_smoke_cpu.py     # no-GPU import + API-surface + signature check (CI-safe)
-#   the 19 suites (also runnable individually):
+#   the 20 suites (also runnable individually):
 python tests/test_mxfp4.py        # MXFP4 E2M1/E8M0 unpacking vs bit-exact reference
 python tests/test_attention.py     # prefill: O & LSE vs an fp32 exact-softmax oracle (max err < 5e-4 / 5e-3)
 python tests/test_decode.py        # decode: fp16 BIT-EXACT (relL2 <= 3e-3), int8 ~0.7%, cache-path == internal
@@ -668,19 +668,46 @@ at 131 072. **The honest claim is parity-to-1.02× against e5m2 with 7.8× the a
 
 > **A warning worth more than the 6%.** Ranking these formats by instruction count gets the answer
 > **backwards**: format 7 has the *fewest* issue slots of all (2814, ceiling 72.8%) and format 8 the
-> *most* (3142, ceiling 65.2%) — and format 8 is faster. This kernel runs at 61% of its own counting
-> ceiling, so an issue costs 0.22–0.30 cycles rather than one, and what actually binds is shared-memory
-> bandwidth. Full derivation and falsifiers: `docs/VOLTA_SM70.md` §3b.
+> *most* (3142, ceiling 65.2%) — and format 8 is faster. An issue on this kernel costs **0.22 cycles
+> when nothing waits on it and 0.49 when it sits on the operand chain** — the same +128 instructions,
+> 2.2× apart — so a count is not a time, and what actually binds is shared-memory bandwidth. Full
+> derivation and falsifiers: `docs/VOLTA_SM70.md` §3b.
 
 ![what actually binds](docs/img/en/binding_resource.png)
 
-Which also settles the `e4m3` question measured in §6: `e4m3` has bias 7, so it needs a rebias. The
-rebias itself is free (a constant ×256 that folds into the softmax scale), but the bit move is not —
-the sign travels 8 positions while the other seven bits travel 7, leaving a gap that byte permutation
-cannot make. Measured in-chain: `e4m3` 1.698× the no-expansion baseline against int8's 1.101× and
-e5m2's 1.065× (`tools/volta_fp8_expand.cu`). **A format is cheap on Volta's tensor cores exactly when
-its layout is a prefix of fp16** — though note that number was taken on a dependent chain, which the
-§3b result says is the wrong lens for predicting in-kernel cost; a direct e4m3 kernel is open work.
+##### And `e4m3` — the format the engine's KV pool actually uses
+
+`e4m3` has bias 7, so it needs a rebias, and the bit move is the hard part: the sign travels 8
+positions while the other seven bits travel 7, leaving a gap byte permutation cannot make. That was
+the whole reason this repo carried a *private* int8 pool format — legal only while every reader is
+ours, and a real mine (on Gemma-4, 40 of 48 layers would read our int8 as `e4m3` and get garbage).
+
+Two things turned out to be wrong about the old verdict, and both were found by measuring rather than
+re-reading:
+
+1. **The expansion is 6 instructions per 4 bytes, not the 8 recorded as the minimum.** The trick is
+   `prmt`'s **sign-replication mode** — the high bit of a selector nibble replicates that byte's sign
+   — so placing `[b, sign(b)]` in adjacent bytes and shifting left by 7 puts the data in bits 13..7
+   and the sign in bit 15, leaving one mask. `__byte_perm` does not expose that mode; it needs inline
+   PTX. The ×256 rebias folds rank-1 into `qk_scale` / the epilogue and is **exact** (a power of two).
+2. **The old cost was measured on a dependent chain, which §3b says is the wrong lens.** In-chain it
+   read 1.698× the no-expansion baseline; **in the kernel it is 1.162× e5m2** — the isolated
+   microbenchmark overpriced it by 46%.
+
+| route | vs `e5m2` | vs shipped int8 | relL2 vs fp32 |
+|---|--:|--:|--:|
+| `e5m2` | 1.000 | 1.058 | 5.44e-2 |
+| **`e4m3`, direct (`nosc=11`)** | **0.862** | **1.10×** | **2.68e-2** |
+| int8 + per-position scale (format 8) | 1.001–1.026 | 1.06× | 7.0e-3 |
+
+So `e4m3` runs **1.10× faster than the shipped int8 path** and lands between the two byte formats on
+accuracy — twice as good as `e5m2`, 3.8× worse than int8-with-scale. Keep int8 as the default where
+every reader is ours; take `e4m3` when the pool is somebody else's. Verified bitwise against the
+frozen `e5m2` reference on data both formats represent exactly (`tests/test_fwd_e4m3.py`), and the
+expansion is exact on all 254 finite byte values.
+
+**A format is cheap on Volta's tensor cores when its layout is a prefix of fp16 — and when it is not,
+the price is a constant, not a wall.**
 
 ##### How far the role structure reaches in `head_dim`
 

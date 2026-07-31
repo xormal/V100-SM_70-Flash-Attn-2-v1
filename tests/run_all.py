@@ -27,6 +27,7 @@ SUITES = [
     "test_vllm_i8_gather.py",# paged->int8 gather (bit-exact) + the byte prefill route into the role kernel
     "test_vllm_i8_pool.py",  # int8 KV POOL end to end: store -> gather -> prefill -> decode, ONE format
     "test_prefill_bytes.py", # public byte-KV prefill (format 8): BITWISE equal to the plain int8 path
+    "test_fwd_e4m3.py",      # direct fp8_e4m3 path (KVFMT=11): exact expansion + bitwise vs the e5m2 reference
 ]
 
 

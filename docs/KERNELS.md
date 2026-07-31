@@ -159,6 +159,7 @@ permute, not arithmetic.
 | `7` | biased byte | per-CHANNEL, folded outside the kernel | no table at all |
 | **`8`** | **biased byte** | **INTERLEAVED `[ks,vs]` table by position** | **FASTEST, bitwise equal to `0`** |
 | `9` | biased byte | interleaved table in fp16 | half the table traffic |
+| **`11`** | **`fp8_e4m3` directly** | none needed (the format carries its exponent) | **for a FOREIGN pool: 1.10× over format 0** |
 | `2`,`3`,`4`,`5`,`10` | falsifiers and diagnostics | — | not for production |
 
 The public entry point for the shipped format 8 (Q in **BSHD** layout `[B,Sq,H,256]`):
@@ -178,6 +179,8 @@ O, lse = ext.attn_fwd_volta_i8(Q, Kq, Ks, Vq, Vs, scale, causal, 0)
 O, lse = ext.attn_fwd_volta_i8(Q, Kb, KVs, Vb, KVs, scale, causal, 8)
 # e5m2 -- no scales, no arguments for them
 O, lse = ext.attn_fwd_volta_e5m2(Q, Kbytes, Vbytes, scale, causal)
+# e4m3 -- the same, with fp8_e4m3 bytes (vLLM's KV-pool format)
+O, lse = ext.attn_fwd_volta_e4m3(Q, Kbytes, Vbytes, scale, causal)
 ```
 
 **Why format 8 is faster.** The cost of the scale table is **not volume** (0.8% of traffic) but the
@@ -324,7 +327,7 @@ comes up, answers, works — on somebody else's path. So check by **behaviour**:
 4. **SASS after every build.** `tools/sass_check.py`: stack frame, `LDL`/`STL`, register count. The
    compiler's spill report is incomplete — a stack frame appears at ZERO declared spills.
 
-Tests: `python tests/run_all.py` (19 suites) or `pytest -q tests/`.
+Tests: `python tests/run_all.py` (20 suites) or `pytest -q tests/`.
 
 ---
 

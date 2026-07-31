@@ -57,9 +57,10 @@ pip install -U botocore boto3 s3transfer      # botocore >= 1.31 no longer impor
 ## 2. Correctness (all exact / bit-close to an fp32 oracle)
 
 ```bash
-python tests/run_all.py         # 19 suites: MXFP4, attention, decode, backward, varlen, dropout, paged,
+python tests/run_all.py         # 20 suites: MXFP4, attention, decode, backward, varlen, dropout, paged,
                                 # alibi, window, quant_cache, decode_mod, fa-interface, HMMA map,
-                                # d=256 forward, GPTQ dequant, W8A16 GEMV, vLLM int8 gather/pool, byte-KV prefill -> "19/19"
+                                # d=256 forward, GPTQ dequant, W8A16 GEMV, vLLM int8 gather/pool, byte-KV prefill,
+                                # direct e4m3 prefill -> "20/20"
 ```
 
 ## 3. Kernel benchmarks (vs torch SDPA)
@@ -105,7 +106,7 @@ card) — note the second column: at `1,1,2048,64` the unsplit kernel is *slower
 | 1, 2, 4096, 64 | **0.164 ms** | 0.340 | 0.374 | **2.28×** |
 
 Correctness is the same gate as everywhere else: `relL2` vs the fp32 oracle is printed next to every row
-and is unchanged by splitting (the partial `O` buffers are fp32), and `tests/run_all.py` stays 19/19.
+and is unchanged by splitting (the partial `O` buffers are fp32), and `tests/run_all.py` stays 20/20.
 
 ### Verifying the d=256 block mainloop independently
 

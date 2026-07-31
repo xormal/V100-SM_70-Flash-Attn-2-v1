@@ -813,6 +813,18 @@ std::tuple<torch::Tensor, torch::Tensor> attn_fwd_volta_i8(
         else if (nosc == 9)   // то же, но таблица в fp16 (half2): вдвое меньше её трафика
                   kern = causal ? fa2_sm70::fwd_ws::volta_fwd_ws<32, BK, D, 2, 4, true,  DC, 1, REV, D, 9>
                                 : fa2_sm70::fwd_ws::volta_fwd_ws<32, BK, D, 2, 4, false, DC, 1, REV, D, 9>;
+        // [e4m3 ПРЯМО ИЗ ЧУЖОГО ПУЛА] Ks/Vs пустые -- формат самомасштабирующийся, как e5m2.
+        // 11 -- боевой кандидат (6 инструкций на 4 байта); 12 -- ФАЛЬСИФИКАТОР (разворот снят,
+        // ответ неверен, меряется доля фазы); 13 -- он же в прежней записи на 8 инструкций.
+        else if (nosc == 11)
+                  kern = causal ? fa2_sm70::fwd_ws::volta_fwd_ws<32, BK, D, 2, 4, true,  DC, 1, REV, D, 11>
+                                : fa2_sm70::fwd_ws::volta_fwd_ws<32, BK, D, 2, 4, false, DC, 1, REV, D, 11>;
+        else if (nosc == 12)
+                  kern = causal ? fa2_sm70::fwd_ws::volta_fwd_ws<32, BK, D, 2, 4, true,  DC, 1, REV, D, 12>
+                                : fa2_sm70::fwd_ws::volta_fwd_ws<32, BK, D, 2, 4, false, DC, 1, REV, D, 12>;
+        else if (nosc == 13)
+                  kern = causal ? fa2_sm70::fwd_ws::volta_fwd_ws<32, BK, D, 2, 4, true,  DC, 1, REV, D, 13>
+                                : fa2_sm70::fwd_ws::volta_fwd_ws<32, BK, D, 2, 4, false, DC, 1, REV, D, 13>;
         else if (nosc == 10)  // как 8, но обращение за масштабами уходит ПЕРВЫМ (сдвиг фазы)
                   kern = causal ? fa2_sm70::fwd_ws::volta_fwd_ws<32, BK, D, 2, 4, true,  DC, 1, REV, D, 10>
                                 : fa2_sm70::fwd_ws::volta_fwd_ws<32, BK, D, 2, 4, false, DC, 1, REV, D, 10>;
@@ -1002,6 +1014,16 @@ std::tuple<torch::Tensor, torch::Tensor> attn_fwd_volta_e5m2(
     auto none = torch::empty({0}, torch::dtype(torch::kFloat32).device(Q.device()));
     return attn_fwd_volta_i8(Q, Kb.view(torch::kChar), none, Vb.view(torch::kChar), none, scale, causal, 0);
 }
+// ТОЧКА ВХОДА ДЛЯ e4m3: тот же байтовый транспорт, но разворот шестью инструкциями на четыре
+// байта (§1e примитивов). Формат ЧУЖОЙ -- ровно тот, которым живёт KV-пул vLLM, -- поэтому байты
+// принимаются как есть, без перекантовки при записи. Множитель 256 разворота свёрнут В ЯДРЕ
+// (масштаб софтмакса у K, нормировка эпилога у V) и стоит ноль.
+std::tuple<torch::Tensor, torch::Tensor> attn_fwd_volta_e4m3(
+        torch::Tensor Q, torch::Tensor Kb, torch::Tensor Vb, double scale, bool causal) {
+    TORCH_CHECK(Kb.element_size() == 1 && Vb.element_size() == 1, "volta fwd e4m3: однобайтовые K/V");
+    auto none = torch::empty({0}, torch::dtype(torch::kFloat32).device(Q.device()));
+    return attn_fwd_volta_i8(Q, Kb.view(torch::kChar), none, Vb.view(torch::kChar), none, scale, causal, 11);
+}
 // [БЕЗ ВТОРОГО ПОТОКА ПОДАЧИ] int8 со СТОЛБЦОВЫМ масштабом: таблицы на позицию нет вовсе.
 // Вызывающий обязан сам домножить Q на масштаб K по каналу и выход -- на масштаб V по каналу;
 // обе свёртки ранга-1 и стоят O(Sq*d) против O(Sq*Sk*d) работы ядра.
@@ -1040,6 +1062,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     m.def("attn_fwd_volta_e5m2", &attn_fwd_volta_e5m2,
           "sm70 forward with e5m2 K/V: byte transport, exact expansion (fp16 == byte<<8), no scales",
+          pybind11::arg("Q"), pybind11::arg("Kb"), pybind11::arg("Vb"),
+          pybind11::arg("scale"), pybind11::arg("causal"));
+    m.def("attn_fwd_volta_e4m3", &attn_fwd_volta_e4m3,
+          "sm70 forward with e4m3 K/V straight from the vLLM pool: 6-instruction expansion, x256 folded",
           pybind11::arg("Q"), pybind11::arg("Kb"), pybind11::arg("Vb"),
           pybind11::arg("scale"), pybind11::arg("causal"));
     m.def("attn_fwd_qbshd", &attn_fwd_qbshd,
