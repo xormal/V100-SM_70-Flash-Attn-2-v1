@@ -1,0 +1,9 @@
+fa2_sm70/_build/
+__pycache__/
+*.pyc
+*.egg-info/
+impl/build/
+build/
+research*/
+.c[l]aude/
+*.pid

@@ -1,0 +1,32 @@
+name: fa2_sm70 CI
+
+# Two-tier CI: a cheap CPU tier runs everywhere (syntax + API smoke, no GPU/CUDA build); the GPU tier
+# runs the full correctness matrix on a self-hosted sm_70 (V100) runner.
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+
+jobs:
+  cpu-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install torch (CPU)
+        run: pip install --index-url https://download.pytorch.org/whl/cpu torch
+      - name: Byte-compile all sources (syntax)
+        run: python -m compileall -q fa2_sm70 tests integrations
+      - name: CPU API smoke test (no GPU)
+        run: python tests/test_smoke_cpu.py
+
+  gpu-matrix:
+    # Requires a self-hosted runner labelled sm70 with the CUDA 12.x toolkit + a V100.
+    runs-on: [self-hosted, sm70]
+    needs: cpu-smoke
+    steps:
+      - uses: actions/checkout@v4
+      - name: Full correctness matrix on sm_70
+        run: python tests/run_all.py

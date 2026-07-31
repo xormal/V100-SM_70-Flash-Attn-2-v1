@@ -1,0 +1,19 @@
+--- v1/attention/backends/flash_attn_v100.py.orig
++++ v1/attention/backends/flash_attn_v100.py
+@@ -271,10 +271,16 @@
+             return super().do_kv_cache_update(layer, key, value, kv_cache,
+                                               slot_mapping)
+         key_cache, value_cache = kv_cache.unbind(1)  # uint8 paged caches
++        # allow_i8: the private int8+per-position-scale layout is legal ONLY while every reader of
++        # these bytes is ours. If this layer's attention does not run on our path (sliding window,
++        # alibi, soft-cap ...), Triton reads the same bytes as e4m3 and the output is garbage. Gemma-4
++        # has 40 such layers out of 48. The pool stays mixed on purpose -- the shim tags the format per
++        # cache. e4m3 is still written by our kernel here, because Triton cannot emit e4m3 on Volta.
+         reshape_and_cache_fp8(
+             key, value, key_cache, value_cache, slot_mapping,
+             self.kv_cache_dtype,
+             _kv_scales(layer)[0], _kv_scales(layer)[1],
++            allow_i8=self._supports_flash_v100_path(),
+         )
+
+     def _reset_decode_cache(self) -> None:

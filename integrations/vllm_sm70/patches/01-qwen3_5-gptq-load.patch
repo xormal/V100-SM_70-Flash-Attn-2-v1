@@ -1,0 +1,19 @@
+--- model_executor/models/qwen3_5.py.orig-preint8	2026-07-25 14:43:05.516544083 +0400
++++ model_executor/models/qwen3_5.py	2026-07-25 14:43:05.531544210 +0400
+@@ -538,6 +538,16 @@
+                     continue
+                 param = params_dict[name]
+                 weight_loader = param.weight_loader
++                # [fa2_sm70 patch] A quantised checkpoint brings parameters that have NO output
++                # dim -- GPTQ's `g_idx` is one value per INPUT row and is therefore shared by every
++                # output shard of a merged column-parallel layer, so it must be loaded whole rather
++                # than split. Without this the tuple-shard branch below dies on `param.output_dim`,
++                # and it dies inside a logger.debug() argument, so it fails even with debug logging
++                # off: "AttributeError: 'RowvLLMParameter' object has no attribute 'output_dim'".
++                # Splitting is only meaningful for parameters that HAVE an output dim.
++                if isinstance(shard_id, tuple) and getattr(param, "output_dim", None) is None:
++                    weight_loader(param, loaded_weight)
++                    break
+                 if isinstance(shard_id, tuple):
+                     # Split by the target module's output shard metadata
+                     # instead of hardcoding tensor shapes.
