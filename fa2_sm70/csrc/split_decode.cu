@@ -850,7 +850,8 @@ template <int EPT, int KVB, bool PAGED = false>
 __global__ void split_defer_kernel(const half* __restrict__ Q, const void* __restrict__ K, const void* __restrict__ V,
                                    const float* __restrict__ sK, const float* __restrict__ sV, const float* __restrict__ Kmax,
                                    float* __restrict__ A, float* __restrict__ B, int H, int Hkv, int Sk, int d, float scale, int ns, int Lc, int kv_len,
-                                   const int* __restrict__ block_table, int block_size, int max_blocks, const int* __restrict__ seqlens) {
+                                   const int* __restrict__ block_table, int block_size, int max_blocks, const int* __restrict__ seqlens,
+                                   const int* __restrict__ kvstart) {
     const int c = blockIdx.x, h = blockIdx.y, b = blockIdx.z;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int hkv = h / (H / Hkv);
@@ -861,8 +862,14 @@ __global__ void split_defer_kernel(const half* __restrict__ Q, const void* __res
     // any work: 12 CTAs on 80 SMs, latency-bound, and that (not the reduce, and not KV bandwidth)
     // was the decode's fixed floor. `seqlens` is already here on the device, so derive the stride
     // from it: the grid stays static (CUDA-graph safe), only each CTA's range moves.
-    const int Lb = seqlens ? ((b_len + ns - 1) / ns) : Lc;
-    const int k0 = c * Lb, k1 = min(k0 + Lb, b_len);
+    // [ОКНО] Скользящий слой отличается от полного ТОЛЬКО левой границей: запрос в позиции P смотрит
+    // на ключи [P-W+1, P]. Правая граница -- это уже имеющийся b_len, поэтому окно целиком выражается
+    // ОДНИМ числом на последовательность: началом диапазона. Это точно ДО ТОКЕНА, в отличие от
+    // подмены строки block_table (та умеет только кратное block_size и тащит лишние ключи), и оно же
+    // снимает трафик: ядро читает W ключей вместо всей длины.
+    const int b_st = kvstart ? kvstart[b] : 0;
+    const int Lb = seqlens ? ((b_len - b_st + ns - 1) / ns) : Lc;
+    const int k0 = b_st + c * Lb, k1 = min(k0 + Lb, b_len);
     const int oidx = ((b * H + h) * ns + c);
     __shared__ float sB[NW], sA[NW * 32 * EPT], sM[NW];
     const half* Qb = Q + (long)(b * H + h) * d;
@@ -1052,7 +1059,8 @@ template <int EPT, int KVB, int GF, bool VEQK = false, bool PAGED = false>
 __global__ void split_defer_mqa_kernel(const half* __restrict__ Q, const void* __restrict__ K, const void* __restrict__ V,
                                        const float* __restrict__ sK, const float* __restrict__ sV, const float* __restrict__ Kmax,
                                        float* __restrict__ A, float* __restrict__ B, int H, int Hkv, int Sk, int d, float scale, int ns, int Lc, int kv_len,
-                                       const int* __restrict__ block_table, int block_size, int max_blocks, const int* __restrict__ seqlens) {
+                                       const int* __restrict__ block_table, int block_size, int max_blocks, const int* __restrict__ seqlens,
+                                       const int* __restrict__ kvstart) {
     // VEQK: values ARE the keys (Gemma-4 global layers, attention_k_eq_v -> no v_proj). We hold the
     // already-loaded K in registers and reuse it as V, halving the HBM read traffic on those layers.
     const int c = blockIdx.x, hg = blockIdx.y, b = blockIdx.z;   // hg: query-head GROUP (GF heads)
@@ -1065,8 +1073,11 @@ __global__ void split_defer_mqa_kernel(const half* __restrict__ Q, const void* _
     // any work: 12 CTAs on 80 SMs, latency-bound, and that (not the reduce, and not KV bandwidth)
     // was the decode's fixed floor. `seqlens` is already here on the device, so derive the stride
     // from it: the grid stays static (CUDA-graph safe), only each CTA's range moves.
-    const int Lb = seqlens ? ((b_len + ns - 1) / ns) : Lc;
-    const int k0 = c * Lb, k1 = min(k0 + Lb, b_len);
+    // [ОКНО] см. split_defer_kernel: левая граница на последовательность -- это всё, чем скользящий
+    // слой отличается от полного, и она точна ДО ТОКЕНА.
+    const int b_st = kvstart ? kvstart[b] : 0;
+    const int Lb = seqlens ? ((b_len - b_st + ns - 1) / ns) : Lc;
+    const int k0 = b_st + c * Lb, k1 = min(k0 + Lb, b_len);
     __shared__ float sB[NW * GF], sA[NW * 32 * EPT * GF], sM[NW * GF];
     float qr[GF][EPT], acc[GF][EPT], m[GF], Bsum[GF];
     #pragma unroll
@@ -1250,9 +1261,9 @@ static void launch_defer(int KVB, const half* q, const void* k, const void* v, c
                          float* A, float* B, float* o, float* lse, int Bb, int H, int Hkv, int Sk, int d, float scale, int ns, int Lc, int kv_len, cudaStream_t st) {
     dim3 g1(ns, H, Bb); dim3 g2(H, Bb);
 #define SPD(EPT) do { \
-        if (KVB == 16) split_defer_kernel<EPT,16><<<g1,BLK,0,st>>>(q,k,v,sk,sv,kmax,A,B,H,Hkv,Sk,d,scale,ns,Lc,kv_len,nullptr,0,0,nullptr); \
-        else if (KVB == 8) split_defer_kernel<EPT,8><<<g1,BLK,0,st>>>(q,k,v,sk,sv,kmax,A,B,H,Hkv,Sk,d,scale,ns,Lc,kv_len,nullptr,0,0,nullptr); \
-        else split_defer_kernel<EPT,4><<<g1,BLK,0,st>>>(q,k,v,sk,sv,kmax,A,B,H,Hkv,Sk,d,scale,ns,Lc,kv_len,nullptr,0,0,nullptr); \
+        if (KVB == 16) split_defer_kernel<EPT,16><<<g1,BLK,0,st>>>(q,k,v,sk,sv,kmax,A,B,H,Hkv,Sk,d,scale,ns,Lc,kv_len,nullptr,0,0,nullptr,nullptr); \
+        else if (KVB == 8) split_defer_kernel<EPT,8><<<g1,BLK,0,st>>>(q,k,v,sk,sv,kmax,A,B,H,Hkv,Sk,d,scale,ns,Lc,kv_len,nullptr,0,0,nullptr,nullptr); \
+        else split_defer_kernel<EPT,4><<<g1,BLK,0,st>>>(q,k,v,sk,sv,kmax,A,B,H,Hkv,Sk,d,scale,ns,Lc,kv_len,nullptr,0,0,nullptr,nullptr); \
         reduce_defer_kernel<EPT><<<g2,32,0,st>>>(A,B,q,kmax,o,lse,H,Hkv,d,ns,scale); } while(0)
     if (d == 512) SPD(16); else if (d == 256) SPD(8); else if (d == 128) SPD(4); else SPD(2);
 #undef SPD
@@ -1285,9 +1296,9 @@ static void launch_defer_mqa(int KVB, const half* q, const void* k, const void* 
                              float* A, float* B, float* o, float* lse, int Bb, int H, int Hkv, int Sk, int d, float scale, int ns, int Lc, int GF, bool veqk, int kv_len, cudaStream_t st) {
     dim3 g1(ns, H / GF, Bb); dim3 g2(H, Bb);
 #define SPDM(EPT, GFV, VQ) do { \
-        if (KVB == 16) split_defer_mqa_kernel<EPT,16,GFV,VQ><<<g1,BLK,0,st>>>(q,k,v,sk,sv,kmax,A,B,H,Hkv,Sk,d,scale,ns,Lc,kv_len,nullptr,0,0,nullptr); \
-        else if (KVB == 8) split_defer_mqa_kernel<EPT,8,GFV,VQ><<<g1,BLK,0,st>>>(q,k,v,sk,sv,kmax,A,B,H,Hkv,Sk,d,scale,ns,Lc,kv_len,nullptr,0,0,nullptr); \
-        else split_defer_mqa_kernel<EPT,4,GFV,VQ><<<g1,BLK,0,st>>>(q,k,v,sk,sv,kmax,A,B,H,Hkv,Sk,d,scale,ns,Lc,kv_len,nullptr,0,0,nullptr); \
+        if (KVB == 16) split_defer_mqa_kernel<EPT,16,GFV,VQ><<<g1,BLK,0,st>>>(q,k,v,sk,sv,kmax,A,B,H,Hkv,Sk,d,scale,ns,Lc,kv_len,nullptr,0,0,nullptr,nullptr); \
+        else if (KVB == 8) split_defer_mqa_kernel<EPT,8,GFV,VQ><<<g1,BLK,0,st>>>(q,k,v,sk,sv,kmax,A,B,H,Hkv,Sk,d,scale,ns,Lc,kv_len,nullptr,0,0,nullptr,nullptr); \
+        else split_defer_mqa_kernel<EPT,4,GFV,VQ><<<g1,BLK,0,st>>>(q,k,v,sk,sv,kmax,A,B,H,Hkv,Sk,d,scale,ns,Lc,kv_len,nullptr,0,0,nullptr,nullptr); \
         reduce_defer_kernel<EPT><<<g2,32,0,st>>>(A,B,q,kmax,o,lse,H,Hkv,d,ns,scale); } while(0)
 #define SPDMV(EPT, GFV) do { if (veqk) SPDM(EPT,GFV,true); else SPDM(EPT,GFV,false); } while(0)
     // GF set is tied to EPT so static smem (NW*32*EPT*GF floats) stays <= 48KB: EPT16 caps at GF4.
@@ -1308,7 +1319,7 @@ static void launch_defer_mqa_paged(const half* q, const void* k, const void* v, 
                                    const int* bt, int bs, int mb, const int* seqlens, cudaStream_t st) {
     dim3 g1(ns, H / GF, Bb); dim3 g2(H, Bb);
 #define SPDMP(EPT, GFV, VQ) do { \
-        split_defer_mqa_kernel<EPT,16,GFV,VQ,true><<<g1,BLK,0,st>>>(q,k,v,nullptr,nullptr,kmax,A,B,H,Hkv,Sk,d,scale,ns,Lc,kv_len,bt,bs,mb,seqlens); \
+        split_defer_mqa_kernel<EPT,16,GFV,VQ,true><<<g1,BLK,0,st>>>(q,k,v,nullptr,nullptr,kmax,A,B,H,Hkv,Sk,d,scale,ns,Lc,kv_len,bt,bs,mb,seqlens,nullptr); \
         reduce_defer_kernel<EPT><<<g2,32,0,st>>>(A,B,q,kmax,o,lse,H,Hkv,d,ns,scale); } while(0)
 #define SPDMVP(EPT, GFV) do { if (veqk) SPDMP(EPT,GFV,true); else SPDMP(EPT,GFV,false); } while(0)
     if (d == 512)      { if (GF == 4) SPDMVP(16,4); else SPDMVP(16,2); }
@@ -1331,7 +1342,7 @@ static void launch_defer_mqa_paged_i8(const half* q, const void* k, const void* 
                                       const int* bt, int bs, int mb, const int* seqlens, cudaStream_t st) {
     dim3 g1(ns, H / GF, Bb); dim3 g2(H, Bb);
 #define SPDMPI(EPT, GFV, VQ) do { \
-        split_defer_mqa_kernel<EPT,8,GFV,VQ,true><<<g1,BLK,0,st>>>(q,k,v,sK,sV,kmax,A,B,H,Hkv,Sk,d,scale,ns,Lc,kv_len,bt,bs,mb,seqlens); \
+        split_defer_mqa_kernel<EPT,8,GFV,VQ,true><<<g1,BLK,0,st>>>(q,k,v,sK,sV,kmax,A,B,H,Hkv,Sk,d,scale,ns,Lc,kv_len,bt,bs,mb,seqlens,nullptr); \
         reduce_defer_kernel<EPT><<<g2,32,0,st>>>(A,B,q,kmax,o,lse,H,Hkv,d,ns,scale); } while(0)
 #define SPDMVPI(EPT, GFV) do { if (veqk) SPDMPI(EPT,GFV,true); else SPDMPI(EPT,GFV,false); } while(0)
     if (d == 512)      { if (GF == 4) SPDMVPI(16,4); else SPDMVPI(16,2); }
@@ -1350,7 +1361,7 @@ static void launch_defer_paged_i8(const half* q, const void* k, const void* v, c
                                   const int* seqlens, cudaStream_t st) {
     dim3 g1(ns, H, Bb); dim3 g2(H, Bb);
 #define SPDPI(EPT) do { \
-        split_defer_kernel<EPT,8,true><<<g1,BLK,0,st>>>(q,k,v,sK,sV,kmax,A,B,H,Hkv,Sk,d,scale,ns,Lc,kv_len,bt,bs,mb,seqlens); \
+        split_defer_kernel<EPT,8,true><<<g1,BLK,0,st>>>(q,k,v,sK,sV,kmax,A,B,H,Hkv,Sk,d,scale,ns,Lc,kv_len,bt,bs,mb,seqlens,nullptr); \
         reduce_defer_kernel<EPT><<<g2,32,0,st>>>(A,B,q,kmax,o,lse,H,Hkv,d,ns,scale); } while(0)
     if (d == 512) SPDPI(16); else if (d == 256) SPDPI(8); else if (d == 128) SPDPI(4); else SPDPI(2);
 #undef SPDPI
@@ -1364,7 +1375,7 @@ static void launch_defer_mqa_paged_f8(const half* q, const void* k, const void* 
                                       const int* bt, int bs, int mb, const int* seqlens, cudaStream_t st) {
     dim3 g1(ns, H / GF, Bb); dim3 g2(H, Bb);
 #define SPDMP8(EPT, GFV, VQ) do { \
-        split_defer_mqa_kernel<EPT,87,GFV,VQ,true><<<g1,BLK,0,st>>>(q,k,v,nullptr,nullptr,kmax,A,B,H,Hkv,Sk,d,scale,ns,Lc,kv_len,bt,bs,mb,seqlens); \
+        split_defer_mqa_kernel<EPT,87,GFV,VQ,true><<<g1,BLK,0,st>>>(q,k,v,nullptr,nullptr,kmax,A,B,H,Hkv,Sk,d,scale,ns,Lc,kv_len,bt,bs,mb,seqlens,nullptr); \
         reduce_defer_kernel<EPT><<<g2,32,0,st>>>(A,B,q,kmax,o,lse,H,Hkv,d,ns,scale); } while(0)
 #define SPDMVP8(EPT, GFV) do { if (veqk) SPDMP8(EPT,GFV,true); else SPDMP8(EPT,GFV,false); } while(0)
     if (d == 512)      { if (GF == 4) SPDMVP8(16,4); else SPDMVP8(16,2); }
@@ -1382,7 +1393,7 @@ static void launch_defer_paged_f8(const half* q, const void* k, const void* v, c
                                   const int* seqlens, cudaStream_t st) {
     dim3 g1(ns, H, Bb); dim3 g2(H, Bb);
 #define SPDP8(EPT) do { \
-        split_defer_kernel<EPT,87,true><<<g1,BLK,0,st>>>(q,k,v,nullptr,nullptr,kmax,A,B,H,Hkv,Sk,d,scale,ns,Lc,kv_len,bt,bs,mb,seqlens); \
+        split_defer_kernel<EPT,87,true><<<g1,BLK,0,st>>>(q,k,v,nullptr,nullptr,kmax,A,B,H,Hkv,Sk,d,scale,ns,Lc,kv_len,bt,bs,mb,seqlens,nullptr); \
         reduce_defer_kernel<EPT><<<g2,32,0,st>>>(A,B,q,kmax,o,lse,H,Hkv,d,ns,scale); } while(0)
     if (d == 512) SPDP8(16); else if (d == 256) SPDP8(8); else if (d == 128) SPDP8(4); else SPDP8(2);
 #undef SPDP8
@@ -1394,7 +1405,7 @@ static void launch_defer_paged(const half* q, const void* k, const void* v, cons
                                float scale, int ns, int Lc, int kv_len, const int* bt, int bs, int mb, const int* seqlens, cudaStream_t st) {
     dim3 g1(ns, H, Bb); dim3 g2(H, Bb);
 #define SPDP(EPT) do { \
-        split_defer_kernel<EPT,16,true><<<g1,BLK,0,st>>>(q,k,v,nullptr,nullptr,kmax,A,B,H,Hkv,Sk,d,scale,ns,Lc,kv_len,bt,bs,mb,seqlens); \
+        split_defer_kernel<EPT,16,true><<<g1,BLK,0,st>>>(q,k,v,nullptr,nullptr,kmax,A,B,H,Hkv,Sk,d,scale,ns,Lc,kv_len,bt,bs,mb,seqlens,nullptr); \
         reduce_defer_kernel<EPT><<<g2,32,0,st>>>(A,B,q,kmax,o,lse,H,Hkv,d,ns,scale); } while(0)
     if (d == 512) SPDP(16); else if (d == 256) SPDP(8); else if (d == 128) SPDP(4); else SPDP(2);
 #undef SPDP
@@ -1478,12 +1489,22 @@ void flash_decode_defer_mqa_paged_into(
     // Значение по умолчанию torch::Tensor() пробрасывается в Python как None, а None в этой сборке
     // torch НЕ приводится к torch::Tensor -- то есть все прежние вызовы на 17 аргументов (весь
     // e4m3-декод обвязки!) начали бы падать с TypeError. Поймано замером, а не рассуждением.
-    std::optional<torch::Tensor> sK_opt, std::optional<torch::Tensor> sV_opt) {
+    std::optional<torch::Tensor> sK_opt, std::optional<torch::Tensor> sV_opt,
+    // [ОКНО] Левая граница диапазона ключей на последовательность, int32 [B]. Отсутствует = ноль,
+    // то есть ровно прежнее поведение -- ни один существующий вызов не меняет смысла. Тем же
+    // std::optional, что и таблицы масштабов, и по той же причине: None не приводится к
+    // torch::Tensor, а значит значение по умолчанию torch::Tensor() сломало бы старые вызовы.
+    std::optional<torch::Tensor> kv_start_opt) {
     const torch::Tensor sK = sK_opt.has_value() ? *sK_opt : torch::Tensor();
     const torch::Tensor sV = sV_opt.has_value() ? *sV_opt : torch::Tensor();
+    const torch::Tensor kv_start = kv_start_opt.has_value() ? *kv_start_opt : torch::Tensor();
     const c10::cuda::CUDAGuard device_guard(Q.device());
     int Bb = Q.size(0), H = Q.size(1), d = Q.size(3), Hkv = Kcache.size(2);
     TORCH_CHECK(Q.scalar_type() == torch::kFloat16 && Q.size(2) == 1);
+    // Диспетчер ниже кончается на `else -> EPT=2`, то есть НЕПОДДЕРЖАННЫЙ d уходил в ядро для d=64
+    // и возвращал мусор МОЛЧА. У соседнего входа (`_impl`) эта проверка есть; здесь её не было, и
+    // именно этот вход обслуживает бэкенд vLLM -- то есть дыра лежала ровно на боевом пути.
+    TORCH_CHECK(d == 64 || d == 128 || d == 256 || d == 512, "paged decode: d in {64,128,256,512}, got ", d);
     TORCH_CHECK(Out.scalar_type() == torch::kFloat16, "Out must be fp16");
     TORCH_CHECK(Kcache.stride(3) == 1 && Kcache.stride(2) == d && Kcache.stride(1) == (long)Hkv * d,
                 "paged KV: [.., block_size, Hkv, d] must be packed within a block");
@@ -1511,6 +1532,16 @@ void flash_decode_defer_mqa_paged_into(
     TORCH_CHECK(A.numel() >= (long)Bb * H * ns * d && B.numel() >= 2 * (long)Bb * H * ns,
                 "workspace too small (B needs 2*B*H*ns: sums + per-split maxima)");
     const int* slp = seqlens.numel() > 0 ? seqlens.data_ptr<int32_t>() : nullptr;
+    // [ОКНО] Начало без КОНЦА бессмысленно: без seqlens ядро берёт длину из kv_len (ёмкости таблицы)
+    // и делит [0, kv_len) на срезы, поэтому сдвиг начала дал бы диапазон, не совпадающий ни с одной
+    // последовательностью. Отвергаем ПАДЕНИЕМ, а не молча.
+    const int* stp = nullptr;
+    if (kv_start.defined() && kv_start.numel() > 0) {
+        TORCH_CHECK(kv_start.scalar_type() == torch::kInt32 && kv_start.is_contiguous()
+                    && kv_start.numel() >= Bb, "kv_start: int32 contiguous [B]");
+        TORCH_CHECK(slp != nullptr, "kv_start requires per-sequence seqlens");
+        stp = kv_start.data_ptr<int32_t>();
+    }
     int GF = pick_gf(d, H / Hkv);
     const half* q = (const half*)Q.data_ptr<at::Half>();
     half* op = (half*)Out.data_ptr<at::Half>();
@@ -1524,10 +1555,10 @@ void flash_decode_defer_mqa_paged_into(
 #define RUNK(EPT, KVB, GFV, VQ)                                                                       \
     do { if (GF <= 1) split_defer_kernel<EPT,KVB,true><<<g1s,BLK,0,st>>>(                             \
              q,kp,vp,skp,svp,km,ap,bp,H,Hkv,(int)blk,d,(float)scale,ns,Lc,valid,                      \
-             block_table.data_ptr<int32_t>(),(int)block_size,mb,slp);                                 \
+             block_table.data_ptr<int32_t>(),(int)block_size,mb,slp,stp);                             \
          else split_defer_mqa_kernel<EPT,KVB,GFV,VQ,true><<<g1,BLK,0,st>>>(                           \
              q,kp,vp,skp,svp,km,ap,bp,H,Hkv,(int)blk,d,(float)scale,ns,Lc,valid,                      \
-             block_table.data_ptr<int32_t>(),(int)block_size,mb,slp);                                 \
+             block_table.data_ptr<int32_t>(),(int)block_size,mb,slp,stp);                             \
          reduce_defer_out_kernel<EPT><<<g2,256,0,st>>>(ap,bp,op,H,d,ns,(long)o_row_stride,          \
                                                       fp8 ? (float)v_scale : 1.0f); } while (0)
 #define RUNV(EPT, KVB, GFV) do { if (veqk) RUNK(EPT,KVB,GFV,true); else RUNK(EPT,KVB,GFV,false); } while (0)
@@ -1993,7 +2024,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           // Таблицы масштабов int8-пула. Отсутствуют (по умолчанию) = пул НЕ int8, и тогда путь тот
           // же, что был: НИ ОДИН существующий вызов на 17 аргументов не меняется -- это проверено
           // вызовом, а не предположено (см. комментарий у сигнатуры про None -> torch::Tensor).
-          py::arg("sK") = std::nullopt, py::arg("sV") = std::nullopt);
+          py::arg("sK") = std::nullopt, py::arg("sV") = std::nullopt,
+          // [ОКНО] Левая граница ключей на последовательность (int32 [B]); None = 0 = прежнее поведение.
+          py::arg("kv_start") = std::nullopt);
     m.def("flash_decode_defer_mqa_paged_i8", &flash_decode_defer_mqa_paged_i8,
           "sm70 paged deferred decode over OUR int8 KV pool (per-(token,kv-head) scales, block-table indexed)",
           py::arg("Q"), py::arg("Kcache"), py::arg("sK"), py::arg("Vcache"), py::arg("sV"), py::arg("Kmax"),

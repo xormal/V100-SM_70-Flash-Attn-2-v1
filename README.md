@@ -974,10 +974,39 @@ compressed KV latent).
 
 ## 6. End-to-end: serving a 27B model on vLLM with these kernels (`integrations/vllm_sm70/`)
 
+> **Update (2026-08-01): there is now a FIRST-CLASS BACKEND, not a module substitution.**
+> The integration below is the shipped, measured one and still works. But substituting somebody
+> else's package forces us to keep their signatures, so we can never honestly declare what we
+> support — and that produced a real defect: the KV store and the attention backend ended up gated by
+> DIFFERENT conditions, so a private int8 pool could be read by a foreign reader as `e4m3` (on Gemma-4
+> that is 40 layers out of 48 reading garbage). The replacement is a backend of our own,
+> `FA2_SM70`, in a current vLLM fork: its own enum member, its own file, its own declared
+> capabilities, and a refusal at start-up instead of a failure mid-forward. What it now serves,
+> all verified by behaviour rather than by inspection:
+>
+> | | |
+> |---|---|
+> | models | Llama-3.2-1B and **Gemma-4-12B** — output **character-identical** to the vendor backend |
+> | shapes | `head_dim` 64/128/**256/512**, sliding window 1024, chunked prefill, GQA/MQA |
+> | KV pool | fp16, **`fp8_e4m3`**, `int8_per_token_head` — the format is marked ON THE CACHE and every reader verifies the mark |
+> | context | **x2.00** on the byte pool (11 261 -> 22 523 tokens for Gemma-4 on one V100-32GB) |
+> | prefill | **1.88x** at L=1024, **3.12x** at L=4096 vs the fork's Triton backend (reproducible to 0.2% over three passes) |
+> | decode | parity on fp16, up to **1.42x** on the byte pool |
+>
+> The prefill margin has a mechanism, not a mystery: **Triton emits no HMMA on `sm_70`**, so it
+> computes attention on the FMA pipe. And on Volta ours is the only backend that serves an `e4m3`
+> pool at all — Triton refuses it outright (`type fp8e4nv not supported in this architecture`).
+>
+> Two defects were found in OUR OWN code on the way, both of the silent kind: a decode dispatcher
+> that ended in a default branch and so returned WRONG RESULTS for an unsupported `head_size`
+> instead of refusing; and a Python wrapper that cost **ten times** the kernels it served (13-16 ms
+> against 1.3-4.0 ms per step) because it recomputed per-layer what is shared per KV group.
+
 vLLM (V1) on `sm_70` selects its `FLASH_ATTN_V100` backend, which lazily does
-`from flash_attn_v100 import ...` and expects four entry points. So the integration is a **module
-substitution**, not a patch: put `integrations/vllm_sm70/` first on `PYTHONPATH` and vLLM runs on
-these kernels. Unset it to get the incumbent back — which is what makes a clean A/B possible.
+`from flash_attn_v100 import ...` and expects four entry points. So the integration below is a
+**module substitution**, not a patch: put `integrations/vllm_sm70/` first on `PYTHONPATH` and vLLM
+runs on these kernels. Unset it to get the incumbent back — which is what makes a clean A/B
+possible.
 
 All four entry points are ours: dense prefill, **paged (prefix/chunked) prefill**, paged decode, and
 the e4m3 KV **store** (one kernel quantises into the engine's strided byte pool *and* folds the new

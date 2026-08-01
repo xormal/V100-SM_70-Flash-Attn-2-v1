@@ -80,10 +80,21 @@ ext = fa2_sm70._ext.prefill_ext()
 O, lse = ext.attn_fwd_volta_i8(Q, Kq, Ks, Vq, Vs, scale, causal, nosc)
 ```
 
-**Level 3 — the engine.** `integrations/vllm_sm70/` substitutes vLLM's attention backend, the KV
-store and the GDN scan; `sample/` and `examples/` run a real model. Acceptance rule: **the graft is
-verified by behaviour, never by a file being present** — a server that came up without our kernels
-looks exactly the same.
+**Level 3 — the engine.** Two routes, and the second one supersedes the first:
+
+* **`FA2_SM70`, a first-class vLLM backend** (current fork): its own enum member, its own file, its
+  own declared capabilities, and a refusal at start-up rather than a failure mid-forward. Serves
+  `head_dim` 64/128/256/512, sliding window, chunked prefill, and a fp16 / `fp8_e4m3` /
+  `int8_per_token_head` KV pool whose format is marked ON THE CACHE and verified by every reader.
+  Enabled with `VLLM_SM70_FA2=1` or `--attention-backend FA2_SM70`.
+* **`integrations/vllm_sm70/`** — the older module substitution (put it first on `PYTHONPATH`). Still
+  works and is what the measurements in the README's §6 were taken on, but substituting somebody
+  else's package means keeping their signatures, so the store and the attention can end up gated by
+  different conditions — which is exactly how a private byte format once leaked to a foreign reader.
+
+Acceptance rule for either: **the graft is verified by behaviour, never by a file being present** — a
+server that came up without our kernels looks exactly the same. Route counters written BY THE WORKER
+ON THE WORK are the cheapest honest proof.
 
 ---
 
@@ -229,6 +240,18 @@ read from HBM **once** instead of once per head: bit-identical, 1.4–1.6× when
 **Split count.** The target is a **CTA count, not a chunk size** (`_auto_splits`). These are not the
 same thing: a "2048-token chunk" rule yields three times too few blocks to fill 80 SMs on a long
 context.
+
+**Sliding window at decode: `kv_start`.** `flash_decode_defer_mqa_paged_into` takes a final optional
+argument `kv_start` — int32 `[B]`, the **left bound of the key range per sequence** (`None` = 0 = the
+previous behaviour bit-for-bit; requires a non-empty `seqlens`). The right bound is already carried by
+`seqlens[b]`, so a sliding layer's window is exactly this one number: `kv_start = max(0, seq_len - W)`.
+It is **exact to the token**, and that is the whole point: substituting the `block_table` row (the only
+workaround that avoids touching the kernel) can only round to `block_size` and drags in up to
+`block_size-1` extra keys. Measured on the Gemma-4 shape (d=256, Hkv=8, W=1024, block_size=16, worst
+remainder): the truncation gives relL2 **1.2e-1**, `kv_start` gives 2.1e-4 (fp16 noise) — at the same
+cost. Gathering the window into a dense buffer is exact too, but 3.3-4.4x more expensive. With no bound
+at all the kernel reads the whole length: 5.3x slower at T=16K, **and wrong**, because the engine has
+already freed the pages to the left of the window.
 
 **Also in this extension:** `gather_paged_kv*` (gathering pages into a contiguous buffer, byte pools
 included), `reshape_and_cache_i8` / `reshape_and_cache_e4m3` (writing the KV store in our format),
