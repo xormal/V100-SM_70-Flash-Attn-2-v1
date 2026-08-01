@@ -2,6 +2,8 @@
 
 > *"The absurdity of a local move is a SEARCH SIGNAL."*
 
+![Pixel-art Volta kernel engineer in a server room](docs/img/github-header.webp)
+
 An importable PyTorch package carrying a **whole compute layer for an inference engine** on hardware
 the ecosystem wrote off: attention in all three regimes (prefill, decode, training), the gated-delta
 linear scan, quantised-weight paths (GPTQ-int8, MXFP4), and paged KV-pool servicing. Modern
@@ -670,8 +672,13 @@ at 131 072. **The honest claim is parity-to-1.02× against e5m2 with 7.8× the a
 > **backwards**: format 7 has the *fewest* issue slots of all (2814, ceiling 72.8%) and format 8 the
 > *most* (3142, ceiling 65.2%) — and format 8 is faster. An issue on this kernel costs **0.22 cycles
 > when nothing waits on it and 0.49 when it sits on the operand chain** — the same +128 instructions,
-> 2.2× apart — so a count is not a time, and what actually binds is shared-memory bandwidth. Full
-> derivation and falsifiers: `docs/VOLTA_SM70.md` §3b.
+> 2.2× apart — so a count is not a time, and what actually binds is shared-memory bandwidth. That
+> last claim spent a day marked *disputed* (a separate probe priced operand delivery at half) and came
+> back **confirmed and strengthened**: MIO cost is measured in **wavefronts**,
+> `max(bank_conflictedness, width_per_lane/8 B, 1)`, and the binding variable is bank conflictedness —
+> at a *fixed* 128 unique bytes, changing only the stride moves the cost **32×**. Verified against
+> `ncu`, 0 discrepancies out of 17; the counter reports 11% *more* traffic than the calculation
+> assumed. Full derivation and falsifiers: `docs/VOLTA_SM70.md` §3b.
 
 ![what actually binds](docs/img/en/binding_resource.png)
 
