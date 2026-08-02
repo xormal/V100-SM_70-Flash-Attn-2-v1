@@ -140,7 +140,21 @@ template <
     // Тип элемента выхода. По умолчанию совпадает со входом (half). Для ЧАСТИЧНЫХ результатов
     // split-K нужен float: свод складывает до num_splits слагаемых с весами по LSE, и округление
     // в half на каждом слагаемом удвоило бы ошибку (2.6e-04 -> ~6e-04).
-    typename output_t_ = scalar_t_>
+    typename output_t_ = scalar_t_,
+    // [Т12 / #129 -- ШИРИНА НАКОПИТЕЛЯ ВЫХОДА] НОВЫЙ ПАРАМЕТР ТОЛЬКО В КОНЕЦ СПИСКА: вставленный в
+    // середину, он молча сдвинул бы позиционные аргументы всех существующих инстанцирований.
+    // При kMaxK > kKeysPerBlock накопитель выхода НЕ ЖИВЁТ в регистрах и ездит через глобальную
+    // память на КАЖДОЙ итерации по ключам. Замер (reports/EV_t4_kv_int12.md §3, d=512, Sq=2048,
+    // Sk=16384): 8.02 ГБ записи + 8.09 ГБ чтения = 72 % ВСЕГО трафика DRAM этого ядра, и он же
+    // вымывает плиту K/V из L2 (попаданий 50.8 % против 98.5 % там, где выплёскивания нет).
+    // false (умолчание) -- накопитель fp32, поведение всех прежних инстанцирований НЕ МЕНЯЕТСЯ
+    //                     НИ НА БИТ (тот же тип, тот же буфер, тот же машинный код);
+    // true            -- накопитель в ТИПЕ ВЫХОДА (half): вдвое меньше байт, И отдельный буфер
+    //                     `output_accum_ptr` пропадает вовсе (kNeedsOutputAccumulatorBuffer=false),
+    //                     то есть заодно снимается рабочая область B*Sq*H*d fp32 (67 МБ при
+    //                     Sq=2048, 268 МБ при Sq=8192).
+    // ЦЕНА -- ТОЧНОСТЬ, и она обязана быть измерена против fp64-эталона ДО секундомера.
+    bool kNarrowOutputAccum_ = false>
 struct AttentionKernel {
   enum CustomMaskType {
     NoCustomMask = 0,
@@ -156,7 +170,10 @@ struct AttentionKernel {
   // Accumulator between 2 iterations
   // Using `accum_t` improves perf on f16 at the cost of
   // numerical errors
-  using output_accum_t = accum_t;
+  // [Т12] ...и ровно этим разменом мы теперь и распоряжаемся ЯВНО, ключом kNarrowOutputAccum_.
+  static constexpr bool kNarrowOutputAccum = kNarrowOutputAccum_;
+  using output_accum_t = typename cutlass::platform::
+      conditional<kNarrowOutputAccum_, output_t_, accum_t>::type;
   static constexpr bool kSupportsDropout = kSupportsDropout_;
   static constexpr bool kSupportsBias = kSupportsBias_;
   static constexpr bool kOutputBHSD = kOutputBHSD_;
@@ -173,6 +190,16 @@ struct AttentionKernel {
   static constexpr bool kNeedsOutputAccumulatorBuffer = !kKeepOutputInRF &&
       !cutlass::platform::is_same<output_accum_t, output_t>::value;
 
+  // [Т12] Узкий накопитель складывает частичный результат ПРЯМО В ВЫХОД, и это законно только
+  // если раскладка накопителя совпадает с раскладкой выхода. Итератор накопителя жёстко берёт шаг
+  // строки `head_dim_value * num_heads` -- это BSHD. У BHSD-выхода шаг головы другой
+  // (Sq*D вместо D), совпадения нет, и молчаливый результат был бы ТИХО НЕВЕРНЫМ, а не падением.
+  static_assert(!kNarrowOutputAccum || !kOutputBHSD,
+                "narrow output accumulator accumulates in place in O and needs the BSHD layout");
+  static_assert(!kNarrowOutputAccum ||
+                    cutlass::platform::is_same<output_t_, scalar_t_>::value,
+                "narrow output accumulator: accumulator type is the OUTPUT type; with an fp32 "
+                "output (split-K partials) narrowing is a no-op and the flag is a lie");
   static_assert(kQueriesPerBlock % 32 == 0, "");
   static_assert(kKeysPerBlock % 32 == 0, "");
   static constexpr int kNumWarpsPerBlock =
@@ -369,7 +396,12 @@ struct AttentionKernel {
             head_id * head_dim_value;
       } else {
         // Accumulate directly in the destination buffer (eg for f32)
-        output_accum_ptr = (accum_t*)output_ptr;
+        // [Т12] Приведение было к `accum_t*` НАГЛУХО -- то есть эта ветка молча предполагала, что
+        // накопитель всегда fp32. При узком накопителе тип совпадает с выходом, и приведение
+        // обязано идти к типу НАКОПИТЕЛЯ, иначе не соберётся. Раскладка при этом совпадает: шаг
+        // строки накопителя (head_dim_value * num_heads) равен o_strideM у BSHD-выхода, а
+        // смещение на (batch, head) считается той же формулой -- см. static_assert ниже.
+        output_accum_ptr = (output_accum_t*)output_ptr;
       }
 
       if (logsumexp_ptr != nullptr) {
@@ -1173,7 +1205,12 @@ struct AttentionKernel {
                       using DefaultEpilogue = typename MM1::DefaultEpilogue;
                       using DefaultOp =
                           typename MM1::DefaultConfig::EpilogueOutputOp;
-                      using ElementCompute = typename DefaultOp::ElementCompute;
+                      // [Т12] ТИП СЧЁТА эпилога берётся у accum_t, а НЕ у типа хранения. При широком накопителе
+                      // это то же самое (DefaultOp::ElementCompute там и есть float), при узком --
+                      // разница между «храним в half» и «СЧИТАЕМ в half»: `s_prime`/`m_prime` лежат
+                      // в accum_t, и молчаливое сползание счёта в half было бы ТИХОЙ потерей точности
+                      // сверх той, за которую мы платим сознательно.
+                      using ElementCompute = accum_t;
                       using EpilogueOutputOp = typename cutlass::epilogue::
                           thread::MemoryEfficientAttentionNormalize<
                               typename cutlass::platform::conditional<
@@ -1237,14 +1274,19 @@ struct AttentionKernel {
       constexpr bool kIsLast = true;
       using DefaultEpilogue = typename MM1::DefaultEpilogue;
       using DefaultOp = typename MM1::DefaultConfig::EpilogueOutputOp;
-      using ElementCompute = typename DefaultOp::ElementCompute;
+      // [Т12] ТИП СЧЁТА эпилога берётся у accum_t, а НЕ у типа хранения. При широком накопителе
+      // это то же самое (DefaultOp::ElementCompute там и есть float), при узком -- разница между
+      // «храним в half» и «СЧИТАЕМ в half»: `s_prime`/`m_prime` лежат в accum_t, и молчаливое
+      // сползание счёта в half было бы ТИХОЙ потерей точности сверх той, за которую мы платим
+      // сознательно.
+      using ElementCompute = accum_t;
       using EpilogueOutputOp =
           typename cutlass::epilogue::thread::MemoryEfficientAttentionNormalize<
               output_t, // output
               output_accum_t, // source
               DefaultOp::kCount,
               typename DefaultOp::ElementAccumulator, // accum
-              output_accum_t, // compute
+              ElementCompute, // compute -- [Т12] был output_accum_t, см. выше
               kIsFirst,
               kIsLast,
               cutlass::Array<ElementCompute, kQueriesPerBlock>>;

@@ -751,13 +751,31 @@ static void launch(int KVB, const half* q, const void* k, const void* v, const f
                    float softcap = 0.f, const float* alibi = nullptr, float* lse = nullptr) {
     dim3 g1(ns, H, B); dim3 g2(H, B);
     const half* qk = topk ? q : nullptr;   // reducer needs Q only for the control point
+    // [ОКНО, НИ РАЗУ НЕ ПРОВЕРЕННОЕ] РАЗДЕЛ L1 / РАЗДЕЛЯЕМОЙ. Эти ядра запускаются со СТАТИЧЕСКОЙ
+    // разделяемой (нулевой динамический аргумент), поэтому раздел 128 КБ выбирает драйвер сам, а мы
+    // в него не вмешивались никогда -- `PreferredSharedMemoryCarveout` не выставлен нигде в дереве.
+    // Гипотеза стоит проверки именно на ДЕКОДЕ: он на 90 % упирается в HBM, а при GQA одну и ту же
+    // плитку KV читают несколько голов группы -- то есть больший L1 может дать попадания там, где
+    // разделяемая простаивает. Обратное тоже возможно, поэтому это ЗАМЕР, а не правка.
+    // FA2SM70_DEC_CARVEOUT = доля разделяемой в процентах (0 = максимум L1, 100 = максимум shared).
+    // Не задан -- поведение прежнее, ни один атрибут не трогается.
+    static const int carve = getenv("FA2SM70_DEC_CARVEOUT") ? atoi(getenv("FA2SM70_DEC_CARVEOUT")) : -1;
+// Склейки токенов тут быть НЕ МОЖЕТ: K -- шаблонное выражение с запятой и угловыми скобками.
+// Каждое раскрытие и так сидит в своей области видимости do{}while(0), поэтому обычный static
+// достаточен и даёт по одному флагу на инстанцирование.
+#define SET_CARVE(K) do { if (carve >= 0) { static bool done = false; if (!done) { \
+        done = true; cudaFuncSetAttribute((const void*)(K), cudaFuncAttributePreferredSharedMemoryCarveout, carve); } } } while(0)
 #define SPL(EPT) do { \
+        if (KVB == 16) SET_CARVE((split_decode_kernel<EPT,16>)); \
+        else if (KVB == 8) SET_CARVE((split_decode_kernel<EPT,8>)); \
+        else SET_CARVE((split_decode_kernel<EPT,4>)); \
         if (KVB == 16) split_decode_kernel<EPT,16><<<g1,BLK,0,st>>>(q,k,v,sk,sv,op,lp,mp,jp,H,Hkv,Sk,d,scale,ns,Lc,softcap,alibi); \
         else if (KVB == 8) split_decode_kernel<EPT,8><<<g1,BLK,0,st>>>(q,k,v,sk,sv,op,lp,mp,jp,H,Hkv,Sk,d,scale,ns,Lc,softcap,alibi); \
         else split_decode_kernel<EPT,4><<<g1,BLK,0,st>>>(q,k,v,sk,sv,op,lp,mp,jp,H,Hkv,Sk,d,scale,ns,Lc,softcap,alibi); \
         reduce_splits_kernel<EPT><<<g2,32,0,st>>>(op,lp,mp,jp,kf,vf,qk,o,lse,H,Hkv,Sk,d,scale,ns); } while(0)
     if (d == 512) SPL(16); else if (d == 256) SPL(8); else if (d == 128) SPL(4); else SPL(2);
 #undef SPL
+#undef SET_CARVE
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

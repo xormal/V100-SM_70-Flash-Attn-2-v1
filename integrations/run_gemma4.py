@@ -21,7 +21,14 @@ NTOK = int(os.environ.get("G4_NTOK", "40"))
 G.register()
 tok = AutoTokenizer.from_pretrained(PATH)
 model = AutoModelForCausalLM.from_pretrained(PATH, attn_implementation="fa2_sm70",
-                                             dtype=torch.bfloat16, device_map="cuda:0").eval()
+    # [fp16, А НЕ bf16 -- ЭТО ЗАМЕР, А НЕ ВКУС]
+    # На sm_70 cuBLAS отдаёт bf16 SIMT-ядру magma_sgemmEx: sm__inst_executed_pipe_tensor = 0 на ВСЕХ
+    # 36 замерах, плитка 64x64, трафик DRAM до 40.5x идеального. Цена -- x8.0...x8.8 на КАЖДОМ
+    # умножении модели. Прежние «437 ток/с» на этом пути объясняются этим полностью.
+    # И fp16 здесь не компромисс, а улучшение по ОБЕИМ осям: на Gemma-4 замерено relL2 0.0044 против
+    # 0.2657 у bf16 (в 60 раз точнее), при максимуме активации 262 против диапазона fp16 до 65504 --
+    # запас x250, переполнение недостижимо.
+                                             dtype=torch.float16, device_map="cuda:0").eval()
 msgs = [{"role": "user", "content": "In one sentence, what makes the V100 GPU architecturally different from newer GPUs?"}]
 enc = tok.apply_chat_template(msgs, add_generation_prompt=True, return_tensors="pt", return_dict=True)
 ids = enc["input_ids"].to("cuda:0")

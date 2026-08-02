@@ -123,8 +123,14 @@ static int fwd_num_splits(int B, int H, int Sq, int Sk, int d, int kQ, int kK, b
   // (dO*O).sum inherits the bad O; dV never touches delta).
   // The gate is set where the measurements are: every split-K win recorded in the README is d<=128.
   if (d > 128) return 1;
-  int nsm = 0;
-  cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, 0);
+  // ЧИСЛО SM БЕРЁМ У ТЕКУЩЕГО УСТРОЙСТВА, А НЕ У НУЛЕВОГО. Здесь стояло жёсткое 0, и это спящий
+  // дефект: он молчит, пока каждый ранг видит ровно свою карту (CUDA_VISIBLE_DEVICES на ранг --
+  // тогда устройство 0 и есть рабочее), и даёт число SM с ЧУЖОЙ карты, как только процесс видит
+  // больше одной. Ошибка при этом не падает и не портит ответ -- она портит МОДЕЛЬ ДРОБЛЕНИЯ, то
+  // есть тихо выбирает неверное число срезов.
+  int dev = 0, nsm = 0;
+  cudaGetDevice(&dev);
+  cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, dev);
   if (nsm <= 0) nsm = 80;
   const long slots = (long)nsm * blocks_per_sm;
   const int nq = (Sq + kQ - 1) / kQ;
@@ -409,12 +415,17 @@ std::tuple<torch::Tensor, torch::Tensor> attn_fwd_cutlass_varlen(
 // larger prefill chunks OOM next to 17.7 GB of int8 weights, and chunk size is exactly the knob that
 // controls how often the whole prefix is re-touched.
 // K/V stay BHSD [B, Hkv, Sk, D] -- our paged gather already emits that layout.
-template <int kQ, int kK, int kMaxK>
+// [Т12 / #129] NACC -- ШИРИНА НАКОПИТЕЛЯ ВЫХОДА. false (умолчание) = fp32, ровно как было; все
+// существующие места вызова НЕ ЗАТРОНУТЫ ни на бит. true = накопитель в half, отдельного буфера
+// нет вовсе. Отдельное ПЛЕЧО, а не подмена умолчания: приз здесь разменивается на ТОЧНОСТЬ, а её
+// нельзя брать по умолчанию до сверки с fp64-эталоном.
+template <int kQ, int kK, int kMaxK, bool NACC = false>
 static std::tuple<torch::Tensor, torch::Tensor> run_fmha_qbshd(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V, double scale, bool causal) {
     const c10::cuda::CUDAGuard device_guard(Q.device());
     using Attention = AttentionKernel<cutlass::half_t, cutlass::arch::Sm70, true, kQ, kK, kMaxK,
-                                      false, false, DefaultToBatchHook, /*kOutputBHSD*/ false>;
+                                      false, false, DefaultToBatchHook, /*kOutputBHSD*/ false,
+                                      /*output_t*/ cutlass::half_t, /*kNarrowOutputAccum*/ NACC>;
     int B = Q.size(0), Sq = Q.size(1), H = Q.size(2), d = Q.size(3);
     int Hkv = K.size(1), Sk = K.size(2);
     auto O = torch::empty({B, Sq, H, d}, torch::dtype(torch::kFloat16).device(Q.device()));   // BSHD out
@@ -765,7 +776,16 @@ std::tuple<torch::Tensor, torch::Tensor> attn_fwd_volta_i8(
                       && ((reinterpret_cast<uintptr_t>(Vq.data_ptr<int8_t>()) & 15) == 0);
     // ВАРИАНТ = nosc/100: 1 -- широкая перекладка; 2 -- широкая загрузка + узкая укладка;
     // 3 -- узкая загрузка + широкая укладка; 4 -- перестановка кусков K (SWZ); 5 -- SWZ + широкая.
-    const int64_t nosc_w = (nosc >= 100 && !wide_ok) ? (nosc % 100) : nosc;
+    // [ОТКАТ -- ТОЛЬКО ДЛЯ ТЕХ ВАРИАНТОВ, КОТОРЫЕ ШИРОКУЮ ПЕРЕКЛАДКУ И ПРОСЯТ]
+    // Прежняя редакция откатывала ЛЮБОЙ nosc >= 100, а широкую перекладку просит РОВНО var == 1.
+    // Значит при невыровненных K/V фальсификаторы фаз (var 11..15), PHSPLIT (20) и KSP (30) МОЛЧА
+    // подменялись боевым ядром: вызывающий получал время БОЕВОГО пути под именем снятой фазы и НИ
+    // ОДНОГО признака ошибки. Это дефект ИЗМЕРИТЕЛЬНОГО пути, а не боевого, и потому опаснее --
+    // он не портит ответ, он портит ВЫВОД. Ровно «проверяй точку входа, а не баннер»: ветвь отката
+    // обязана быть привязана к ПРИЧИНЕ отката (нужна ли этому варианту широкая перекладка),
+    // а не к диапазону кода.
+    const bool wide_req = (nosc >= 100) && ((nosc / 100) == 1);
+    const int64_t nosc_w = (wide_req && !wide_ok) ? (nosc % 100) : nosc;
     if (usews && nosc_w >= 100) {
         const int64_t f = nosc_w % 100, var = nosc_w / 100;
 #define FA2_WS_VAR(F, W, S) (causal ? fa2_sm70::fwd_ws::volta_fwd_ws<32, BK, D, 2, 4, true,  DC, 1, REV, D, F, W, S> \
@@ -780,13 +800,19 @@ std::tuple<torch::Tensor, torch::Tensor> attn_fwd_volta_i8(
         else if (f == 7 && var == 1) kern = FA2_WS_VAR(7, 1, 0);
         else if (f == 8 && var == 1) kern = FA2_WS_VAR(8, 1, 0);
         else if (f == 8 && var == 4) kern = FA2_WS_VAR(8, 0, 1);
+        // [ОТГРУЖЕНО УМОЛЧАНИЕМ 02.08.2026 -- см. ветку nosc==11 ниже] Явный вход в перестановку
+        // K-группы на e4m3. Замер, ради которого он заводился, состоялся: 1.0740x, 6/6 форм,
+        // побитово, -- и умолчание включено. Вход оставлен: он равен умолчанию, а базу для
+        // повторного A/B теперь даёт FA2SM70_WS_SWZ=0.
+        else if (f == 11 && var == 4) kern = FA2_WS_VAR(11, 0, 1);
         else if (f == 8 && var == 30) kern = FA2_WS_KSP(8, 0);   // расщепление цепочки накопителя
         else if (f == 8 && var == 20) kern = FA2_WS_PH(8, 0);   // разведение фаз по группам строк
         else if (f == 8 && var == 11) kern = FA2_WS_DIAG(8, 1);   // ФАЛЬСИФИКАТОР: без софтмакса
         else if (f == 8 && var == 12) kern = FA2_WS_DIAG(8, 2);   // ФАЛЬСИФИКАТОР: без внутренних защёлок
         else if (f == 8 && var == 13) kern = FA2_WS_DIAG(8, 3);   // ФАЛЬСИФИКАТОР: без второго умножения
         else if (f == 8 && var == 14) kern = FA2_WS_DIAG(8, 4);   // ФАЛЬСИФИКАТОР: везущие не везут
-        else if (f == 8 && var == 15) kern = FA2_WS_DIAG(8, 5);   // ФАЛЬСИФИКАТОР: без первого умножения
+        else if (f == 8 && var == 15) kern = FA2_WS_DIAG(8, 5);
+        else if (f == 8 && var == 16) kern = FA2_WS_DIAG(8, 6);   // ФАЛЬСИФИКАТОР: ОБА умножения сняты   // ФАЛЬСИФИКАТОР: без первого умножения
         else TORCH_CHECK(false, "volta fwd i8: нет варианта для nosc=", nosc);
 #undef FA2_WS_KSP
 #undef FA2_WS_PH
@@ -795,6 +821,12 @@ std::tuple<torch::Tensor, torch::Tensor> attn_fwd_volta_i8(
         nthr = (4 + 8) * 32;
     } else if (usews) {   // роли: везущие + считающие, один блок
         const int64_t nosc = nosc_w;   // откат с широкой перекладки попадает сюда
+        // ОДИН выключатель перестановки K-группы на ОБА формата (8 и 11). Раздельные вентили здесь
+        // были бы миной того же рода, что уже стоила нам 40 слоёв из 48: склад и внимание тогда
+        // гейтились РАЗНЫМИ условиями, и половина модели читала наш формат как чужой.
+        // Откат: FA2SM70_WS_SWZ=0 -- он же оставляет базу для A/B, иначе мерить стало бы нечем.
+        static const bool swz_off = (getenv("FA2SM70_WS_SWZ") != nullptr
+                                     && atoi(getenv("FA2SM70_WS_SWZ")) == 0);
         if (nosc == 1)
                   kern = causal ? fa2_sm70::fwd_ws::volta_fwd_ws<32, BK, D, 2, 4, true,  DC, 1, REV, D, 4>
                                 : fa2_sm70::fwd_ws::volta_fwd_ws<32, BK, D, 2, 4, false, DC, 1, REV, D, 4>;
@@ -807,18 +839,44 @@ std::tuple<torch::Tensor, torch::Tensor> attn_fwd_volta_i8(
         else if (nosc == 7)   // смещённый байт БЕЗ таблицы -- полный кандидат
                   kern = causal ? fa2_sm70::fwd_ws::volta_fwd_ws<32, BK, D, 2, 4, true,  DC, 1, REV, D, 7>
                                 : fa2_sm70::fwd_ws::volta_fwd_ws<32, BK, D, 2, 4, false, DC, 1, REV, D, 7>;
-        else if (nosc == 8)   // смещённый байт + ЧЕРЕДУЮЩАЯСЯ таблица (Ks -- float2 [ks,vs] на позицию)
+        else if (nosc == 8) { // смещённый байт + ЧЕРЕДУЮЩАЯСЯ таблица (Ks -- float2 [ks,vs] на позицию)
+          // [ПЕРЕСТАНОВКА K-ГРУППЫ ВКЛЮЧЕНА ПО УМОЛЧАНИЮ -- ЗАМЕР 01.08.2026]
+          // Конфликты банков 19.4 % -> 5.8 %; ВРЕМЯ: медиана 1.0753x, выиграло 6/6 форм
+          // (1.049 при Sq2048/Sk32768 ... 1.149 при Sq512/Sk2048). Ответ побитово тот же -- сверено
+          // torch.equal на четырёх формах, включая GQA и MQA: перестановка это только РАЗМЕЩЕНИЕ.
+          // РАБОТАЕТ ТОЛЬКО ВМЕСТЕ С АМПЛИТУДОЙ 64 (volta_warp_mma.h swj + volta_fwd_ws.cuh kcd):
+          // с прежней амплитудой 16 та же перестановка МЁРТВАЯ и стоит -1.25 % (замерено).
+          if (swz_off)
                   kern = causal ? fa2_sm70::fwd_ws::volta_fwd_ws<32, BK, D, 2, 4, true,  DC, 1, REV, D, 8>
                                 : fa2_sm70::fwd_ws::volta_fwd_ws<32, BK, D, 2, 4, false, DC, 1, REV, D, 8>;
+          else
+                  kern = causal ? fa2_sm70::fwd_ws::volta_fwd_ws<32, BK, D, 2, 4, true,  DC, 1, REV, D, 8, 0, 1>
+                                : fa2_sm70::fwd_ws::volta_fwd_ws<32, BK, D, 2, 4, false, DC, 1, REV, D, 8, 0, 1>;
+        }
         else if (nosc == 9)   // то же, но таблица в fp16 (half2): вдвое меньше её трафика
                   kern = causal ? fa2_sm70::fwd_ws::volta_fwd_ws<32, BK, D, 2, 4, true,  DC, 1, REV, D, 9>
                                 : fa2_sm70::fwd_ws::volta_fwd_ws<32, BK, D, 2, 4, false, DC, 1, REV, D, 9>;
         // [e4m3 ПРЯМО ИЗ ЧУЖОГО ПУЛА] Ks/Vs пустые -- формат самомасштабирующийся, как e5m2.
         // 11 -- боевой кандидат (6 инструкций на 4 байта); 12 -- ФАЛЬСИФИКАТОР (разворот снят,
         // ответ неверен, меряется доля фазы); 13 -- он же в прежней записи на 8 инструкций.
-        else if (nosc == 11)
+        else if (nosc == 11) {
+          // [ПЕРЕСТАНОВКА K-ГРУППЫ ВКЛЮЧЕНА ПО УМОЛЧАНИЮ И ЗДЕСЬ -- ЗАМЕР 02.08.2026]
+          // Это БОЕВОЙ маршрут сервера (e4m3 прямо из чужого пула), а умолчание стояло только на
+          // формате 8, то есть выигрыш до сервера не доезжал. Перенос проверен своим замером, а не
+          // рассуждением по аналогии: e4m3 -- другая распаковка, и у нас уже был случай, когда
+          // правка, выигравшая на одном формате, на другом стоила -1.25 %.
+          // ВРЕМЯ: медиана 1.0740x, выиграло 6/6 форм (1.0300 при Sq2048/Sk32768 ... 1.1182 при
+          // Sq512/Sk2048), парное чередование внутри раунда, частоты 1530. Ответ ПОБИТОВО тот же на
+          // всех шести формах (torch.equal, гейт стоял РАНЬШЕ секундомера) -- перестановка меняет
+          // только РАЗМЕЩЕНИЕ. Совпадение с форматом 8 (1.0753) -- свидетельство, что рычаг лежит в
+          // раскладке K-группы, а не в распаковке байта.
+          if (swz_off)
                   kern = causal ? fa2_sm70::fwd_ws::volta_fwd_ws<32, BK, D, 2, 4, true,  DC, 1, REV, D, 11>
                                 : fa2_sm70::fwd_ws::volta_fwd_ws<32, BK, D, 2, 4, false, DC, 1, REV, D, 11>;
+          else
+                  kern = causal ? fa2_sm70::fwd_ws::volta_fwd_ws<32, BK, D, 2, 4, true,  DC, 1, REV, D, 11, 0, 1>
+                                : fa2_sm70::fwd_ws::volta_fwd_ws<32, BK, D, 2, 4, false, DC, 1, REV, D, 11, 0, 1>;
+        }
         else if (nosc == 12)
                   kern = causal ? fa2_sm70::fwd_ws::volta_fwd_ws<32, BK, D, 2, 4, true,  DC, 1, REV, D, 12>
                                 : fa2_sm70::fwd_ws::volta_fwd_ws<32, BK, D, 2, 4, false, DC, 1, REV, D, 12>;
@@ -880,6 +938,25 @@ static inline bool volta_fwd_disabled() {
     return e && *e && *e != '0';
 }
 
+// [Т12 / #129 -- ПЛЕЧО A/B, НЕ БОЕВОЙ ПУТЬ] Тот же вход, что у `attn_fwd_qbshd`, и ТЕ ЖЕ плитки;
+// отличается РОВНО ОДНИМ: накопитель выхода half вместо fp32 (и, как следствие, отсутствие
+// рабочей области B*Sq*H*d fp32). Существует, чтобы отделить цену НАКОПИТЕЛЯ от всего остального
+// фальсификатором, у которого совпадает всё, кроме предмета спора.
+// ГЕЙТ ТОЧНОСТИ СТАВИТСЯ ВЫЗЫВАЮЩИМ И РАНЬШЕ СЕКУНДОМЕРА: сверять с fp64-эталоном, а не со второй
+// реализацией той же схемы -- та повторит ту же ошибку.
+std::tuple<torch::Tensor, torch::Tensor> attn_fwd_qbshd_acc16(torch::Tensor Q, torch::Tensor K,
+                                                              torch::Tensor V, double scale, bool causal) {
+    int Sq = Q.size(1), H = Q.size(2), d = Q.size(3), Hkv = K.size(1), Sk = K.size(2);
+    TORCH_CHECK(Q.scalar_type() == torch::kFloat16 && H % Hkv == 0, "qbshd acc16: fp16/GQA");
+    TORCH_CHECK(Q.is_contiguous() && K.is_contiguous() && V.is_contiguous(), "qbshd acc16: contiguous inputs");
+    TORCH_CHECK(d > 128, "qbshd acc16: при d <= kKeysPerBlock накопитель И ТАК в регистрах -- плечо "
+                         "не имеет предмета, и молчаливое согласие означало бы замер пустоты");
+    (void)Sq;
+    if (d <= 256) return run_fmha_qbshd<128, 128, 256, true>(Q, K, V, scale, causal);
+    TORCH_CHECK(d <= 512, "qbshd acc16: d<=512");
+    return run_fmha_qbshd<128, 128, 512, true>(Q, K, V, scale, causal);
+}
+
 std::tuple<torch::Tensor, torch::Tensor> attn_fwd_qbshd(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
                                                         double scale, bool causal) {
     int Sq = Q.size(1), H = Q.size(2), d = Q.size(3), Hkv = K.size(1), Sk = K.size(2);
@@ -914,7 +991,16 @@ std::tuple<torch::Tensor, torch::Tensor> attn_fwd_qbshd(torch::Tensor Q, torch::
         if (Sk >= 8192 && Sq >= 128) return run_fmha_qbshd<128, 128, 256>(Q, K, V, scale, causal);
         return run_fmha_qbshd<32, 128, 256>(Q, K, V, scale, causal);
     }
-    if (d <= 512) return run_fmha_qbshd<32, 128, 512>(Q, K, V, scale, causal);
+    // [ТО ЖЕ САМОЕ НА БОЕВОМ ВХОДЕ] Это вход, которым пользуется vLLM (gather_paged_kv -> qbshd),
+    // и у него, в отличие от attn_fwd_cutlass, НЕТ НИ ОДНОГО кноба. Правку надо ставить ИМЕННО
+    // сюда, иначе эксперименты переменными окружения на сервере не делают ничего -- это уже
+    // случалось (см. «проверяй точку входа, а не баннер»). Обоснование лестницы -- у близнеца ниже.
+    if (d <= 512) {
+      static const int q512 = getenv("FA2SM70_FWD512") ? atoi(getenv("FA2SM70_FWD512")) : 128;
+      if (Sk >= 8192 && Sq >= 128 && q512 >= 128) return run_fmha_qbshd<128, 128, 512>(Q, K, V, scale, causal);
+      if (Sk >= 8192 && Sq >= 64  && q512 >= 64)  return run_fmha_qbshd<64, 128, 512>(Q, K, V, scale, causal);
+      return run_fmha_qbshd<32, 128, 512>(Q, K, V, scale, causal);
+    }
     TORCH_CHECK(false, "qbshd: head_dim <= 512");
 }
 
@@ -1001,7 +1087,32 @@ std::tuple<torch::Tensor, torch::Tensor> attn_fwd_cutlass(torch::Tensor Q, torch
             return run_fmha<64, 128, 256>(Qc, Kc, Vc, scale, causal, window, softcap, al, window_right);
         return run_fmha<32, 128, 256>(Qc, Kc, Vc, scale, causal, window, softcap, al, window_right);
     }
-    if (d <= 512) return run_fmha<32, 128, 512>(Qc, Kc, Vc, scale, causal, window, softcap, al, window_right);         // MLA-scale head_dim
+    // [ПЛИТКА ЗАПРОСОВ ПРИ d=512 -- ЛЕСТНИЦЫ НЕ БЫЛО, А У d=256 ОНА ЕСТЬ СТРОКОЙ ВЫШЕ]
+    // Замер счётчиками (Gemma-4, глобальные слои, Sq=8192): при Sk=128K ядро читает 660 ГБ при
+    // обязательном минимуме 0.335 ГБ -- превышение в 1970 раз, из них 80 % перечитывание KV и 20 %
+    // круговые рейсы накопителя выхода. ОБА слагаемых делятся на kQ, значит 32 -> 128 даёт 660 ->
+    // 166 ГБ. Связывает при этом ПАМЯТЬ, а не тензорная труба: у d=512 замерено L2 34-38 %,
+    // HBM 68-69 %, stall long_scoreboard 47 -> 62 по мере роста Sk. (Домашнее правило «префилл
+    // сидит в L2 на 97.7 %» снято на КВАДРАТНЫХ ПОЛНЫХ формах d<=256 и на боевые формы Gemma-4
+    // НЕ ПЕРЕНОСИТСЯ.) Потолок хода -- не полоса, а L1: 34.5 % * 3.98 > 100, то есть до x2.9.
+    // ЗАМЕРЕНО 02.08.2026, kQ=32 против 128, парные медианы, частоты 1530, ПОБИТОВО везде (7/7):
+    //   Sq8192 Sk131072 H8  1.6383x     Sq8192 Sk32768 H4  1.1460x
+    //   Sq8192 Sk 65536 H8  1.5291x     Sq8192 Sk  8192    1.0614x
+    //   Sq8192 Sk131072 H4  1.4708x     Sq2048 Sk32768     1.0340x
+    //                                   Sq4096 Sk16384     1.0166x
+    // Выигрыш МОНОТОННО растёт с Sk -- то есть попадает ровно в наш рабочий режим (250K).
+    // Расчёт по трафику обещал x2.5-2.9, вышло 1.64: недобор есть (упирается в L1), но ход реален.
+    // ВАЖНО ПРО МЕТОД: первый замер я сделал при Sk<=32768 и получил 1.02-1.15, то есть ПОЧТИ НИЧЕГО;
+    // заявка же снята при Sk=131072. Проверять надо В ТОЙ ТОЧКЕ, ГДЕ СДЕЛАНА ЗАЯВКА.
+    // Откат: FA2SM70_FWD512=32 (он же оставляет базу для A/B, иначе мерить станет нечем).
+    if (d <= 512) {
+      static const int q512 = getenv("FA2SM70_FWD512") ? atoi(getenv("FA2SM70_FWD512")) : 128;
+      if (Sk >= 8192 && Sq >= 128 && q512 >= 128)
+          return run_fmha<128, 128, 512>(Qc, Kc, Vc, scale, causal, window, softcap, al, window_right);
+      if (Sk >= 8192 && Sq >= 64 && q512 >= 64)
+          return run_fmha<64, 128, 512>(Qc, Kc, Vc, scale, causal, window, softcap, al, window_right);
+      return run_fmha<32, 128, 512>(Qc, Kc, Vc, scale, causal, window, softcap, al, window_right);
+    }
     if (d <= 768) return run_fmha<32, 128, 768>(Qc, Kc, Vc, scale, causal, window, softcap, al, window_right);         // >512 (output-accum, smem ~33KB)
     if (d <= 1024) return run_fmha<32, 128, 1024>(Qc, Kc, Vc, scale, causal, window, softcap, al, window_right);       // up to 1024
     TORCH_CHECK(false, "cutlass FMHA wrapper: d<=1024");
@@ -1070,6 +1181,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("scale"), pybind11::arg("causal"));
     m.def("attn_fwd_qbshd", &attn_fwd_qbshd,
           "sm70 cutlass FMHA forward, Q and O both BSHD [B,S,H,D] (chunked-prefill: no transposes)",
+          pybind11::arg("Q"), pybind11::arg("K"), pybind11::arg("V"), pybind11::arg("scale"), pybind11::arg("causal"));
+    m.def("attn_fwd_qbshd_acc16", &attn_fwd_qbshd_acc16,
+          "sm70 cutlass FMHA forward, BSHD in/out, HALF output accumulator (T12 A/B arm: half the "
+          "accumulator bytes and no fp32 workspace; accuracy must be gated against fp64 first)",
           pybind11::arg("Q"), pybind11::arg("K"), pybind11::arg("V"), pybind11::arg("scale"), pybind11::arg("causal"));
     m.def("attn_fwd_cutlass", &attn_fwd_cutlass, "sm70 cutlass FMHA forward (optional sliding window / softcap / ALiBi)",
           pybind11::arg("Q"), pybind11::arg("K"), pybind11::arg("V"), pybind11::arg("scale"),

@@ -211,13 +211,29 @@ __global__ void mxfp4_gemv_kernel(const __half* __restrict__ x,
   // 5.7 KB = 16 MB of traffic to deliver 5.7 KB of data, and the kernel measured 56 GB/s against the
   // dense fp16 path's 613 GB/s -- 2.7x SLOWER despite reading 4x fewer weight bytes. Reading fewer
   // bytes only helps if the other operand is not re-fetched N times.
+  //
+  // ПОПРАВКА 02.08.2026: прежнее «GEMV is bandwidth-bound, dequant ALU is free» ОПРОВЕРГНУТО.
+  // Ядро связано СВОИМ ЖЕ конфликтом банков: 32 полосы ложились на 2 банка (конфликтность 16.00),
+  // и канал разделяемой стоил 256 тактов на варп-итерацию против ~75 у глобальной -- запас 3.4x.
+  // Не полоса связывала, а раскладка. Лечение -- шаг блока 34 полуслова, см. SXB ниже.
+  // [ШАГ БЛОКА 34 ПОЛУСЛОВА, А НЕ 32 -- СНЯТИЕ 16-КРАТНОГО КОНФЛИКТА БАНКОВ]
+  // Полоса ell читает sx + ell*32 как half2, то есть адрес СЛОВА = 16*ell + i. При фиксированном i
+  // величина 16*ell mod 32 принимает РОВНО ДВА значения {0,16}: тридцать два разных адреса ложатся
+  // на два банка, конфликтность 16.00 по замкнутой форме |R| / |{r*S mod 32}|.
+  // Шаг 34 полуслова (= 17 слов) даёт 17*ell mod 32 -- биекция (17 нечётно, взаимно просто с 32),
+  // конфликтность 1.00. Выравнивание half2 сохранено: 34*2 = 68 Б кратно 4.
+  // Кривая проверена целиком: дополнения 2/4/8 слов ХУЖЕ (2.00/4.00/8.00) -- одностороннее
+  // «дополнить, чтобы банки разъехались» здесь неверно, годится ровно НЕЧЁТНОЕ число слов.
+  // Ответ не меняется НИ НА БИТ: это только размещение.
+  static constexpr int SXB = 34;                      // полуслов на блок из 32 значений
   extern __shared__ __half sx[];
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   const int K = nblk * 32;
   const int nthr = WARPS * 32;
 
   for (int m = 0; m < M; ++m) {
-    for (int t = threadIdx.x; t < K; t += nthr) sx[t] = x[(long)m * K + t];
+    for (int t = threadIdx.x; t < K; t += nthr)
+      sx[(t >> 5) * SXB + (t & 31)] = x[(long)m * K + t];
     __syncthreads();
     const int n = blockIdx.x * WARPS + warp;                 // output feature
     if (n < N) {
@@ -228,7 +244,7 @@ __global__ void mxfp4_gemv_kernel(const __half* __restrict__ x,
         const int sv = ws[b];                                // E8M0, folded into the exponent below
         const uint4 packed = *reinterpret_cast<const uint4*>(wb + (long)b * 16);
         const uint8_t* by = reinterpret_cast<const uint8_t*>(&packed);
-        const __half2* xb = reinterpret_cast<const __half2*>(sx + b * 32);
+        const __half2* xb = reinterpret_cast<const __half2*>(sx + b * SXB);
 #pragma unroll
         for (int i = 0; i < 16; ++i) {
           const uint32_t v = by[i];
@@ -253,7 +269,7 @@ torch::Tensor mxfp4_gemv(torch::Tensor x, torch::Tensor blocks, torch::Tensor sc
   TORCH_CHECK(xc.size(-1) == (long)nblk * 32, "mxfp4 gemv: K mismatch");
   auto y = torch::empty({M, N}, torch::dtype(torch::kFloat16).device(xc.device()));
   constexpr int WARPS = 4;
-  const size_t shm = (size_t)nblk * 32 * sizeof(__half);
+  const size_t shm = (size_t)nblk * 34 * sizeof(__half);   // 34, а не 32: см. SXB в ядре
   mxfp4_gemv_kernel<WARPS><<<(N + WARPS - 1) / WARPS, WARPS * 32, shm,
                              at::cuda::getCurrentCUDAStream()>>>(
       reinterpret_cast<const __half*>(xc.data_ptr<at::Half>()),

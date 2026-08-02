@@ -30,8 +30,45 @@ SUITES = [
     "test_fwd_e4m3.py",      # direct fp8_e4m3 path (KVFMT=11): exact expansion + bitwise vs the e5m2 reference
 ]
 
+# [ОБНАРУЖЕНИЕ С ДИСКА -- СПИСОК РУКАМИ ГНИЁТ МОЛЧА]
+# Список выше зашит руками, и 02.08.2026 в нём НЕ ОКАЗАЛОСЬ трёх наборов, лежащих рядом:
+# test_gdn.py, test_sparse_mech.py, test_smoke_cpu.py. Харнесс при этом печатал «20/20 passed» --
+# то есть отчитывался об успехе, ни разу не запустив ядра линейной мешалки. Правку в них едва не
+# отгрузили, «проверив» харнессом, который их не проверяет.
+# Это ВТОРОЙ случай того же класса в этом файле (первый: pytest-наборы запускались как скрипты и
+# молча не выполняли ни одной проверки). Отсюда правило: приёмочный харнесс обязан ДОКАЗЫВАТЬ, что
+# работа шла, а не перечислять то, что кто-то вспомнил внести.
+_known = set(SUITES)
+_found = sorted(f for f in os.listdir(HERE) if f.startswith("test_") and f.endswith(".py"))
+_extra = [f for f in _found if f not in _known]
+SUITES = SUITES + _extra          # порядок известных сохраняется, новое добирается в конец
+_missing = [f for f in _known if f not in _found]
+
+# [НАБОРЫ, ТРЕБУЮЩИЕ ИНТЕРПРЕТАТОРА С VLLM]
+# test_gdn.py берёт ЭТАЛОН из vllm.model_executor.layers.fla.ops.cumsum, поэтому в обычном окружении
+# падает на ModuleNotFoundError -- и ровно поэтому годами не значился в списке и НЕ ЗАПУСКАЛСЯ.
+# Молчаливый пропуск хуже громкого падения, но громкое падение на каждом прогоне приучает его
+# игнорировать -- а привычка игнорировать красное и есть то, как пропускают настоящие дефекты.
+# Поэтому: интерпретатор из FA2SM70_VLLM_PYTHON, если он задан; если нет -- ЧЕСТНЫЙ ПРОПУСК с названной причиной,
+# а не "PASS" и не "FAIL".
+_VLLM_PY = os.environ.get("FA2SM70_VLLM_PYTHON")
+NEEDS_VLLM = {"test_gdn.py"}
+
+
+def _interp_for(suite):
+    """(интерпретатор, причина_пропуска). Причина не None -> набор пропускается осознанно."""
+    if suite in NEEDS_VLLM:
+        if _VLLM_PY and os.path.exists(_VLLM_PY):
+            return _VLLM_PY, None
+        return None, "нужен FA2SM70_VLLM_PYTHON с установленным vllm (эталон из vllm...fla.ops.cumsum)"
+    return sys.executable, None
+
 
 def main():
+    if _extra:
+        print(f"# ДОБРАНО С ДИСКА (не было в списке): {', '.join(_extra)}")
+    if _missing:
+        print(f"# !! В СПИСКЕ ЕСТЬ, НА ДИСКЕ НЕТ: {', '.join(_missing)}")
     env = dict(os.environ)
     env.setdefault("CUDA_VISIBLE_DEVICES", "0")
     results = []
@@ -48,12 +85,17 @@ def main():
         # test_vllm_i8_gather, test_vllm_i8_pool, test_prefill_bytes) -- 58 собираемых проверок -- числились
         # пройденными, ни разу не исполнившись. Ровно тот класс отказа, ради которого в этом проекте
         # гейт проверяется ПОВЕДЕНИЕМ: харнесс обязан доказать, что тесты шли, а не что файл открылся.
+        interp, skip_why = _interp_for(s)
+        if skip_why:
+            results.append((s, "SKIP", 0.0))
+            print(f"  SKIP   {s:<24}  {skip_why}")
+            continue
         src = open(path, encoding="utf-8").read()
         pytest_style = "\ndef test_" in src
         if pytest_style:
-            cmd = [sys.executable, "-m", "pytest", "-q", path]
+            cmd = [interp, "-m", "pytest", "-q", path]
         else:
-            cmd = [sys.executable, path]
+            cmd = [interp, path]
         p = subprocess.run(cmd, capture_output=True, text=True, env=env)
         dt = time.time() - t0
         # код 5 у pytest -- "ни одного теста не собрано"; для нас это ОТКАЗ, а не успех.
@@ -67,8 +109,15 @@ def main():
     print("\n=== fa2_sm70 test matrix ===")
     for s, st, dt in results:
         print(f"  {st:5s}  {s:24s} {dt:6.1f}s")
-    n_fail = sum(1 for _, st, _ in results if st != "PASS")
-    print(f"=== {len(results) - n_fail}/{len(results)} suites passed ===")
+    n_pass = sum(1 for _, st, _ in results if st == "PASS")
+    n_skip = sum(1 for _, st, _ in results if st == "SKIP")
+    n_fail = len(results) - n_pass
+    # ПРОПУСК СЧИТАЕТСЯ НЕПРОЙДЕННЫМ НАМЕРЕННО: непройденное не становится пройденным оттого, что у
+    # него есть уважительная причина. Но в итоговой строке пропуск обязан быть ВИДЕН отдельно от
+    # провала -- иначе одно начнут читать как другое, а привычка читать красное как жёлтое и есть
+    # то, как пропускают настоящие дефекты.
+    tail = f" (из них ПРОПУЩЕНО {n_skip}: см. причины выше)" if n_skip else ""
+    print(f"=== {n_pass}/{len(results)} suites passed{tail} ===")
     sys.exit(1 if n_fail else 0)
 
 

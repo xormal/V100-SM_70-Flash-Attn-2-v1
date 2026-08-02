@@ -134,8 +134,13 @@ def _build(name, source, flags, inc=None):
     spurious ~8-10min full recompiles whenever a fresh process loads a different extension than the
     last one did. Per-extension dirs make each load hit its own cached .so (no cross-ext thrash)."""
     bdir = os.path.join(_BUILD, name)
-    os.makedirs(bdir, exist_ok=True)
+    # ВНУТРИ try, А НЕ ДО НЕГО. Создание каталога -- ПЕРВОЕ, что здесь падает, и падало оно голым
+    # `PermissionError`, минуя всю подсказку ниже (включая ветку "build dir not writable", ради
+    # которой она и писалась). Замерено на себе 02.08.2026: один прогон профилировщика под `sudo`
+    # создал `_build/` от root -- и приёмочный харнесс отрапортовал 22 набора FAIL, ни один из
+    # которых не имел отношения к правке. Диагноз стоил трёх шагов вместо нуля.
     try:
+        os.makedirs(bdir, exist_ok=True)
         return load(name=name, sources=[os.path.join(_CSRC, source)], build_directory=bdir,
                     extra_include_paths=inc, extra_cuda_cflags=flags)
     except Exception as e:

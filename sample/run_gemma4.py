@@ -34,7 +34,14 @@ print(f"loading {args.path} (attn_implementation=fa2_sm70) ...", flush=True)
 t0 = time.time()
 tok = AutoTokenizer.from_pretrained(args.path)
 model = AutoModelForCausalLM.from_pretrained(
-    args.path, attn_implementation="fa2_sm70", dtype=torch.bfloat16, device_map=args.device).eval()
+    # [fp16, А НЕ bf16 -- ЭТО ЗАМЕР, А НЕ ВКУС]
+    # На sm_70 cuBLAS отдаёт bf16 SIMT-ядру magma_sgemmEx: sm__inst_executed_pipe_tensor = 0 на ВСЕХ
+    # 36 замерах, плитка 64x64, трафик DRAM до 40.5x идеального. Цена -- x8.0...x8.8 на КАЖДОМ
+    # умножении модели. Прежние «437 ток/с» на этом пути объясняются этим полностью.
+    # И fp16 здесь не компромисс, а улучшение по ОБЕИМ осям: на Gemma-4 замерено relL2 0.0044 против
+    # 0.2657 у bf16 (в 60 раз точнее), при максимуме активации 262 против диапазона fp16 до 65504 --
+    # запас x250, переполнение недостижимо.
+    args.path, attn_implementation="fa2_sm70", dtype=torch.float16, device_map=args.device).eval()
 in_dev = model.get_input_embeddings().weight.device   # handles both "cuda:0" and "auto" (multi-GPU)
 print(f"loaded in {time.time()-t0:.1f}s  (input device {in_dev})", flush=True)
 
