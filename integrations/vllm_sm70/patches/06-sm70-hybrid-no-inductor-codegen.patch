@@ -1,0 +1,80 @@
+--- config/vllm.py.orig
++++ config/vllm.py
+@@ -1556,6 +1556,77 @@
+             else:
+                 self.compilation_config.mode = CompilationMode.NONE
+
++        # [fa2_sm70 patch] SM70 + ГИБРИДНАЯ СЕТКА: ПОРОЖДЕНИЕ КОДА inductor ДАЁТ НЕВЕРНЫЙ ОТВЕТ.
++        #
++        # ЧТО ЛОМАЕТСЯ. На гибридных Qwen3.6 (linear_attention + full_attention: 48+16 и 30+10)
++        # с backend="inductor" сетка отвечает СВЯЗНЫМ, но НЕВЕРНЫМ текстом. Ни отказа, ни
++        # падения, ни NaN -- ответ просто не про то ("1999-2000)\n- **1999-2000**:" на вопрос
++        # о столице Франции). Это худший класс дефекта: он проходит любую проверку, которая
++        # смотрит на значения, а не на смысл.
++        #
++        # ЧЕМ ДОКАЗАНО, ЧТО ДЕЛО НЕ В ЯДРАХ ВНИМАНИЯ. При одинаковой компиляции FA2_SM70 (наш
++        # бэкенд) и TRITON_ATTN (чужой) выдают ПОБИТОВО ОДИН И ТОТ ЖЕ мусор -- те же токены
++        # 16, 24, 24, 24, 12, 17, ... Значит бэкенд внимания на результат не влияет вовсе.
++        #
++        # ЧЕМ ДОКАЗАНО, ЧТО ДЕЛО ИМЕННО В ПОРОЖДЕНИИ КОДА. backend="eager" меняет НЕ ОДНУ вещь,
++        # а ЧЕТЫРЕ (это ловушка, стоившая нам ложного обвинения собственных ядер):
++        #   1) снимает порождение кода inductor;
++        #   2) kernel_config.ir_op_priority: "native" -> "vllm_c" (platforms/cuda.py);
++        #   3) compilation_config.custom_ops: ["none"] -> ["all"];
++        #   4) compilation_config.ir_enable_torch_wrap: True -> False.
++        # Пункты 2-4 сняты ПООТДЕЛЬНО, каждый одной переменной, и КАЖДЫЙ ОПРОВЕРГНУТ:
++        # inductor+vllm_c -- мусор; eager+native -- верно; inductor+custom_ops=all -- мусор;
++        # eager+custom_ops=none -- верно; inductor+torch_wrap=False -- мусор.
++        # Остаётся пункт 1, и он же подтверждён прямо: у ПЕРВОГО расходящегося куска графа
++        # (submod_2) в оба плеча вложены ПОБИТОВО ОДИНАКОВЫЕ входы, а выходы разошлись на ~100%.
++        # То есть это не накопление шума fp16, а неверный код.
++        #
++        # ЧТО УЖЕ ПРОБОВАЛИ И ЧТО НЕ ПОМОГАЕТ (не тратьте на это время заново):
++        #   * одновременное отключение 12 проходов inductor -- epilogue_fusion, combo_kernels,
++        #     split_reductions, allow_buffer_reuse, layout_optimization, comprehensive_padding,
++        #     shape_padding, pattern_matcher, reorder_for_locality, joint_graph_constant_folding,
++        #     permute_fusion, benchmark_combo_kernel: мусор ПОБИТОВО тот же;
++        #   * статические формы (compile_sizes=[1,22]): мусор ДРУГОЙ, но всё равно мусор;
++        #   * torch.empty_like -> zeros_like для self_attention_output (qwen3_next.py): не помогает,
++        #     и подстановка ЯДА (full_like(1234.0)) доказала, что содержимое буфера никуда не течёт;
++        #   * VLLM_SM70_ENABLE_DENSE_F16_FASTPATH=0 (наше ядро sm70_f16_gemm в том же куске): не помогает.
++        # То есть это НЕ отдельный проход inductor и НЕ конкретное наше ядро; сузить до одного
++        # узла внутри submod_2 не удалось. Диагноз честно остаётся на уровне "порождение кода".
++        #
++        # ЦЕНА ЭТОГО ЛЕЧЕНИЯ -- ЗАМЕРЕНА, А НЕ ОЦЕНЕНА. Qwen3.6-27B-AWQ, одна V100, TP=1,
++        # промпт 1024, выдача 128, медиана 3 повторов:
++        #   декод  11.16 -> 7.16 ток/с (-36%);  префилл 0.966 -> 0.992 с (в пределах разброса).
++        # Лечение стоит дорого. Оно стоит здесь потому, что альтернатива -- молча неверный ответ,
++        # а не потому, что оно дёшево. Снимать его можно только вместе с настоящим исправлением.
++        #
++        # ПОЧЕМУ ЗДЕСЬ, А НЕ В ПУСКАЧЕ. В пускаче это строка, которую забудут при следующем
++        # переносе, и сетка снова начнёт врать молча. Здесь это МЕХАНИЗМ: он привязан к признаку
++        # (sm70 + is_hybrid), стоит ДО того, как custom_ops/ir_enable_torch_wrap выводятся из
++        # backend, и потому переключает все четыре пункта согласованно.
++        # Аварийный выход, если понадобится замерить дефект заново:
++        #   VLLM_SM70_ALLOW_INDUCTOR_ON_HYBRID=1
++        # (читается прямо из окружения, чтобы патч трогал ровно один файл).
++        #
++        # ГРАНИЦЫ. Замерено на ДВУХ гибридных Qwen3.6 (48+16 и 30+10). Негибридные сетки этот
++        # блок не трогает: у Gemma-4 пускач гасит порождение кода отдельно, по своему замеру.
++        if (
++            self.model_config is not None
++            and self.compilation_config.mode == CompilationMode.VLLM_COMPILE
++            and self.compilation_config.backend == "inductor"
++            and self.model_config.is_hybrid
++            and current_platform.is_cuda()
++            and current_platform.is_device_capability((7, 0))
++            and os.environ.get("VLLM_SM70_ALLOW_INDUCTOR_ON_HYBRID", "0") != "1"
++        ):
++            self.compilation_config.backend = "eager"
++            logger.warning_once(
++                "SM70 + hybrid model: forcing compilation backend 'inductor' -> 'eager'. "
++                "Inductor code generation produces a SILENTLY WRONG answer on hybrid "
++                "(linear_attention + full_attention) models on sm_70; the graph is still "
++                "traced and split, only code generation is disabled. Costs about 36% of "
++                "decode throughput. Override with VLLM_SM70_ALLOW_INDUCTOR_ON_HYBRID=1."
++            )
++
+         # By default, enable torch wrapping only when using custom Inductor lowering
+         if self.compilation_config.ir_enable_torch_wrap is None:
+             self.compilation_config.ir_enable_torch_wrap = (

@@ -1,0 +1,708 @@
+# [fa2_sm70 patch] 08 -- свёртка обнулений GPTQ + инвариант прохода (задача #92)
+#
+# ЧТО. csrc/.../quantization/gptq/q_gemm.cu: выходы C декодных умножений берутся из
+# постоянной плиты, и вся занятая часть плиты зануляется ОДНИМ узлом cudaMemsetAsync на
+# токен вместо 236 ядер-заливок. Замерено на боевой раскладке (236 умножений, 11.38 ГБ
+# весов, B=1, карта V100): 15.357 -> 14.904 мс на токен, то есть -0.45 мс (потолок,
+# "не обнулять вовсе" -- 14.880, взято 95% потолка).
+#
+# ЗАЧЕМ ИНВАРИАНТ. Механизм корректен только если на КАЖДЫЙ проход (токен) приходится
+# ровно один узел обнуления, а слоты прохода -- это префикс плиты. Единица здесь --
+# ПРОХОД, и она не совпадает ни с флагом "мы внутри захвата", ни с идентификатором
+# захваченного графа. Обе ошибки замерены, обе дают неверные числа БЕЗ падения:
+#   * граница по флагу (прежняя): два графа, захваченных подряд, сливаются -> второй
+#     без узла обнуления -> на втором воспроизведении относительная ошибка 1.0, на
+#     третьем 2.0 (накопление atomicAdd);
+#   * граница по id захвата: при cudagraph_mode=full_and_piecewise один проход
+#     захватывается десятками графов -> узел обнуления в каждом куске -> +1.06 мс на
+#     токен (вдвое больше всего выигрыша) И неверные числа (ошибка 1.65), потому что
+#     обнуление куска затирает выходы предыдущих кусков ТОГО ЖЕ прохода.
+# Поэтому граница выводится из самого прохода (эталонная последовательность ширин n),
+# а нарушение -- ОТКАЗ, а не тихий откат.
+#
+# ПЕРЕМЕННЫЕ СРЕДЫ:
+#   VLLM_GPTQ_ZERO_C=fold        включить (умолчание пускача); =1 выключить полностью
+#   VLLM_GPTQ_FOLD_EXPECT=236    закрепить длину прохода (боевая модель -- 236)
+#   VLLM_GPTQ_FOLD_MB=40         размер плиты
+#   VLLM_GPTQ_FOLD_ZERO_ALL=1    фальсификатор: занулять всю плиту, а не занятый префикс
+#   VLLM_GPTQ_FOLD_LEGACY=1|check|graph   фальсификаторы обеих прежних границ
+#
+# Применять из корня дерева vLLM:  patch -p0 < 08-gptq-fold-pass-invariant.patch
+diff --git csrc/libtorch_stable/quantization/gptq/q_gemm.cu csrc/libtorch_stable/quantization/gptq/q_gemm.cu
+index e3f79c5a6..4c4cdc617 100644
+--- csrc/libtorch_stable/quantization/gptq/q_gemm.cu
++++ csrc/libtorch_stable/quantization/gptq/q_gemm.cu
+@@ -5,6 +5,10 @@ https://github.com/qwopqwop200/GPTQ-for-LLaMa
+
+ #include <cstdint>
+ #include <cstdio>
++#include <cstdlib>  // [fa2_sm70] getenv for the VLLM_GPTQ_ZERO_C switch
++#include <cstring>  // [fa2_sm70] strcmp for the VLLM_GPTQ_ZERO_C modes
++#include <string>
++#include <vector>  // [fa2_sm70] эталонная последовательность прохода (инвариант #92)
+
+ #include "../../torch_utils.h"
+ #include <torch/csrc/stable/ops.h>
+@@ -25,7 +29,22 @@ namespace gptq {
+ #define BLOCK_M_SIZE_MAX 8
+ #define MAX_GROUPS_IN_BLOCK (BLOCK_KN_SIZE / 32)
+ #define MAX_Q_GEMM_ROWS 50
+-#define MAX_Q_GEMM_ROWS_8BIT 24
++// [ПОРОГ ПОДНЯТ 24 -> 33, ЗАМЕР НА VOLTA 02.08.2026]
++// Значение 24 досталось от upstream exllama и на sm_70 НЕ МЕРИЛОСЬ НИ РАЗУ. Кривая времени сплошь
++// по M (боевые формы при TP=2, мкс) показывает, что СТУПЕНЬ В ТОЧКЕ ПОРОГА НАПРАВЛЕНА ВВЕРХ:
++//   17408x5120, 8 бит:  M=24 -> 616 (поплиточно)   M=25 -> 835 (reconstruct)   +36 %
++//   5120x17408, 8 бит:  M=24 -> 617                M=25 -> 841                 +36 %
++//   5120x5120,  8 бит:  M=24 -> 191                M=25 -> 270                 +41 %
++// То есть на M=25..33 движок уходил на ветку, которая ХУЖЕ. Ветка reconstruct плоская по M
++// (835 -> 856 при M=25 -> 64), поплиточная растёт на 24.4 мкс/строку, пересечение на M ~ 33
++// (три формы дают 33/33/36).
++// ЧЕСТНО ПРО ЭКСТРАПОЛЯЦИЮ: выше M=24 поплиточная ветка была НЕДОСТИЖИМА без правки этой самой
++// константы, поэтому точка 33 вычислена по наклону, а не снята. Правка ОДНОВРЕМЕННО является
++// экспериментом: после пересборки надо снять прямой A/B на M=25..40 и, если пересечение окажется
++// раньше, опустить значение сюда же.
++// Валюта: батчевый декод и спекулятивные пачки. На префилле НОЛЬ (там M=4096, обе ветки reconstruct).
++// MAX_Q_GEMM_ROWS (4 бита) НЕ ТРОГАЕМ: замеренное пересечение ~55 против стоящих 50 даёт всего +8 %.
++#define MAX_Q_GEMM_ROWS_8BIT 33
+ #define MAX_ALT_GEMM_ROWS 8
+ #define THREADS_X 32
+ #define THREADS_Y 32
+@@ -1490,6 +1509,24 @@ void reconstruct_gptq(const uint32_t* b_q_weight, const uint32_t* b_gptq_qzeros,
+                                            width, groups, use_v2_format, out);
+ }
+
++// [fa2_sm70] THE SAME PREDICATE, ONE PLACE. gptq_gemm() below must know which branch
++// gemm_half_q_half_cuda() will take, because only the branch matters for whether C has
++// to arrive zeroed:
++//   * reconstruct  -> cublasHgemm with beta = 0, which does NOT read C: zeroing is DEAD;
++//   * quantized/alt -> the kernels accumulate with atomicAdd over a blockIdx.z split of k
++//                     (gridDim.z = ceil(size_k / BLOCK_KN_SIZE)), so C is the accumulator
++//                     and MUST start at zero.
++// Factored out rather than copied so the two cannot drift apart.
++inline bool gptq_gemm_uses_reconstruct(int size_m, bool use_exllama, int bit) {
++  if (use_exllama) {
++    return ((bit == 8 && size_m > MAX_Q_GEMM_ROWS_8BIT) ||
++            (bit != 8 && size_m > MAX_Q_GEMM_ROWS));
++  }
++  // The 2/3-bit kernels are somehow slower than dequant + gemm baseline, so
++  // we disabled them for now.
++  return (bit < 4 || size_m > MAX_ALT_GEMM_ROWS);
++}
++
+ void gemm_half_q_half_cuda(cublasHandle_t cublas_handle, const half* a,
+                            const uint32_t* b_q_weight,
+                            const uint32_t* b_gptq_qzeros,
+@@ -1497,15 +1534,8 @@ void gemm_half_q_half_cuda(cublasHandle_t cublas_handle, const half* a,
+                            half* c, half* temp_dq, int size_m, int size_n,
+                            int size_k, int groups, bool use_exllama,
+                            bool use_v2_format, int bit) {
+-  bool use_reconstruct;
+-  if (use_exllama) {
+-    use_reconstruct = ((bit == 8 && size_m > MAX_Q_GEMM_ROWS_8BIT) ||
+-                       (bit != 8 && size_m > MAX_Q_GEMM_ROWS));
+-  } else {
+-    // The 2/3-bit kernels are somehow slower than dequant + gemm baseline, so
+-    // we disabled them for now.
+-    use_reconstruct = (bit < 4 || size_m > MAX_ALT_GEMM_ROWS);
+-  }
++  const bool use_reconstruct =
++      gptq_gemm_uses_reconstruct(size_m, use_exllama, bit);
+   if (use_reconstruct) {
+     // Reconstruct FP16 matrix, then cuBLAS
+     if (use_exllama) {
+@@ -1821,6 +1851,551 @@ void shuffle_exllama_weight(uint32_t* q_weight, int* q_perm, int height,
+   shuffle_kernel<<<gridDim, blockDim, 0, stream>>>(q_weight, height, width);
+ }
+
++// =================== [fa2_sm70 patch] СВЁРТКА ОБНУЛЕНИЙ GPTQ ==================
++// [fa2_sm70 patch] ПАРА-1 + задача #92. Правка целиком наша, в ванильном vLLM её нет.
++// Снимает 236 ядер-заливок C на декодный токен, заменяя их ОДНИМ узлом графа, и
++// закрывает две мины, каждая из которых даёт неверные числа БЕЗ падения (подробности
++// и инварианты -- ниже, разбор "ЕДИНИЦА -- ПРОХОД, А НЕ ГРАФ").
++// ============================ [fa2_sm70 / ПАРА-1] ============================
++// ПАССАЖИР ОБНУЛЕНИЯ: N ядер-заливок на токен -> ОДИН узел графа.
++// (На боевой модели Qwen3.6-27B-INT8 при TP=2 таких умножений ровно 236 на токен:
++//  16 полных слоёв x 3 (o_proj, gate_up, down) + 47 линейных x 4 (in_proj_qkvz,
++//  out_proj, gate_up, down). Слой 0 не квантован, qkv_proj и in_proj_ba исключены
++//  правилом dynamic в quantization_config.)
++//
++// ЗАЧЕМ. На декодном пути (size_m <= 24 при 8 битах) ядро gemm_half_q_half_gptq_*
++// накапливает в C через atomicAdd по расщеплению k (gridDim.z = size_k/128), поэтому C
++// ОБЯЗАН приходить нулевым -- убрать нули нельзя. Но по трассе боевого декода каждая
++// такая заливка стоит 1.888 мкс ядра + 0.951 мкс зазора между узлами графа при полезной
++// работе 2.5-17 КБ: это 99% ЧИСТАЯ ЦЕНА СУЩЕСТВОВАНИЯ ЗАПУСКА.
++//
++// КАК. Выходы декодных умножений берутся не у аллокатора, а из ПОСТОЯННОЙ плиты
++// (cudaMalloc вне графа). Внутри одного прохода смещения детерминированы, поэтому в
++// графе они зафиксированы. Вся плита зануляется ОДНИМ cudaMemsetAsync на первом
++// умножении токена: к этому моменту выходы ПРЕДЫДУЩЕГО токена уже прочитаны и мертвы.
++//
++// ================== ЕДИНИЦА -- ПРОХОД, А НЕ ГРАФ (задача #92) ================
++// Здесь ровно одна нетривиальная мысль, и она куплена двумя ошибками подряд.
++//
++// ЕДИНИЦА, на которой обязан стоять один узел обнуления, -- это ПРОХОД (токен), то
++// есть весь набор из E умножений одного шага модели. Она НЕ совпадает ни с флагом
++// "мы внутри захвата", ни с идентификатором захваченного графа:
++//
++//  * ОШИБКА 1 (была отгружена, спала). Границу прохода определяли флагом in_capture,
++//    снимавшимся только при вызове ВНЕ захвата. Работает лишь потому, что vLLM
++//    сегодня успевает сделать между двумя захватами хотя бы одно умножение вне
++//    графа. Захвати движок два графа подряд -- второй проход продолжил бы плиту
++//    ПРЕЖНЕГО и не получил бы узла обнуления вовсе: тихо неверные числа, без падения.
++//
++//  * ОШИБКА 2 (первое лечение, было бы регрессом). Границу взяли у CUDA:
++//    cudaStreamGetCaptureInfo даёт уникальный id захвата, сменился id -> новый проход.
++//    Но при cudagraph_mode=full_and_piecewise ОДИН проход захватывается ДЕСЯТКАМИ
++//    графов (замерено на живой сетке: 48 захватов по 4 слота на проход). Тогда узел
++//    обнуления ВСЕЙ плиты ставится в КАЖДЫЙ кусок: 48 x 8 МБ = 384 МБ записей на
++//    токен вместо 8 МБ. Числа верные, а весь выигрыш механизма (0.51 мс/токен) съеден
++//    -- отказ, который не падает и не врёт, а просто отменяет сам себя.
++//
++// ЛЕЧЕНИЕ. Границу прохода задаёт САМ ПРОХОД: последовательность выходных ширин n
++// умножений в проходе детерминирована моделью и одинакова от токена к токену
++// (m у всех умножений прохода тоже один -- это число токенов пакета). Поэтому:
++//   E        -- длина прохода в умножениях (закрепляется VLLM_GPTQ_FOLD_EXPECT=236
++//               либо выучивается на первом проходе);
++//   ref[k]   -- эталонная ширина k-го умножения прохода.
++// Проход закрывается ровно на E-м умножении, следующее умножение начинает новый ->
++// сброс плиты + новый узел обнуления. Разбиение на куски при этом НЕ мешает: куски
++// продолжают проход, узел обнуления один и лежит в ПЕРВОМ куске.
++//
++// ИНВАРИАНТЫ. Нарушение любого -- ОТКАЗ (STD_TORCH_CHECK), а не тихий откат: тихий
++// откат здесь и есть тот дефект, из-за которого сервер отвечает неверными числами.
++//   (I1) k-е умножение прохода обязано иметь ширину ref[k], а m -- совпадать с m
++//        прохода. Это ловит всё сразу: два прохода, слипшихся в один (ошибка 1);
++//        проход, потерявший умножения; чужую модель, вклинившуюся в тот же процесс.
++//   (I2) узел обнуления ставится ровно один раз за проход, на его первом умножении.
++//   (I3) слот обязан влезть в плиту. НЕ нарушение: не влез -- честный откат на
++//        new_zeros (численно верно, просто без выигрыша), но откат СЧИТАЕТСЯ и
++//        занимает свою позицию k, чтобы последовательность не поехала.
++//   (I4) плита живёт на ОДНОМ устройстве. Вызов с чужого устройства -- откат
++//        (тоже численно верный), а не свёртка по чужому указателю.
++//   (I5) выученная последовательность не имеет периода меньше своей длины. Это
++//        единственная защита обучения: если E не закреплён, а первые два прохода
++//        слиплись, выучилось бы E=2*236 с периодом 236 -- и слипание стало бы
++//        "нормой". Периодичность ловит это на месте.
++//        (Закреплённый E защищён иначе: неверное значение ловится на ВТОРОМ проходе
++//         сверкой ширин, потому что наименьший период боевой последовательности
++//         равен её длине -- 16 слоёв по 3 умножения, затем 47 по 4.)
++//
++// ПОЧЕМУ НЕ СБРОС С ХОСТА (рассмотрено и отклонено). Честнее всего выглядит явный
++// вызов "начался проход" из шима: он даёт правильную единицу и в разбиении, и в целом
++// графе. Но: (а) он обязан быть врезан в КАЖДЫЙ путь исполнения (боевой шаг,
++// профилировочный прогон, захват, черновая модель спекулятивного декода), и пропуск
++// одного пути -- это НОВЫЙ отказ того же класса "молча неверно", только теперь на
++// стороне питона, где из ядра его не видно; (б) он ничего не доказывает: ядру всё
++// равно нужен инвариант, чтобы поймать пропущенный вызов. Инвариант (I1) ловит
++// пропуск границы САМ, без хоста, и работает даже если шим вообще не наш. Поэтому
++// граница выводится из данных прохода, а хост не участвует.
++namespace {
++struct ZeroSlab {
++  void* base = nullptr;
++  size_t bytes = 0;  // размер плиты И размер обнуления в начале прохода
++  size_t bump = 0;   // указатель внутри ТЕКУЩЕГО прохода
++  int device = -1;   // (I4) на каком устройстве живёт плита
++  bool tried = false;
++
++  // --- состояние ТЕКУЩЕГО прохода ---
++  int pos = 0;        // сколько умножений прохода уже прошло (слоты + откаты)
++  int slots = 0;      // из них свёрнуто в плиту
++  int fb_cap = 0;     // из них откачено по ёмкости (I3)
++  int m_cur = 0;      // m прохода (одинаков у всех его умножений)
++  bool open = false;  // проход начат
++  bool zeroed = false;                // (I2) узел обнуления этого прохода поставлен
++  unsigned long long graph_zero = 0;  // id графа, куда лёг узел обнуления
++  unsigned long long zeroed_graph_prev = 0;  // то же у ПРЕДЫДУЩЕГО прохода
++  unsigned long long graph_last = 0;         // id последнего виденного графа
++  int pieces = 0;  // сколько РАЗНЫХ графов в проходе (диагностика разбиения)
++  size_t zero_bytes = 0;  // сколько байт зануляет узел обнуления ЭТОГО прохода
++  size_t zeroed_now = 0;  // сколько занулено фактически (для печати)
++  int zero_m = -1;        // для какого m посчитано zero_bytes (кэш на проход)
++
++  // --- эталон прохода ---
++  std::vector<int> ref;  // ширины n по позициям
++  bool ref_ready = false;
++  int expect = -1;  // E: -1 = ещё не известен
++  bool pinned = false;
++
++  // --- накопительное ---
++  long long passes = 0;
++  long long folded = 0;
++  long long fb_device = 0;  // (I4) откаты по чужому устройству
++  bool warned_device = false;
++  bool warned_same_graph = false;
++  bool warned_observe = false;
++  bool in_capture = false;  // прежний (ненадёжный) признак -- только для LEGACY
++};
++ZeroSlab g_zslab;
++
++// Идентификатор текущего захвата (false = поток не захватывает). ОТКАЗ, если CUDA не
++// смогла ответить: без него не отличить "внутри графа" от "вне", а это разные правила
++// жизни плиты.
++bool fold_capture_id(cudaStream_t stream, unsigned long long& id) {
++  cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
++  unsigned long long raw_id = 0;
++  cudaError_t err = cudaStreamGetCaptureInfo(stream, &status, &raw_id);
++  STD_TORCH_CHECK(err == cudaSuccess,
++                  "[fa2_sm70] fold: cudaStreamGetCaptureInfo failed: ",
++                  cudaGetErrorString(err),
++                  ". Границу захвата графа определить нечем -> ОТКАЗ. "
++                  "Отключите свёртку: VLLM_GPTQ_ZERO_C=1");
++  if (status != cudaStreamCaptureStatusActive) return false;
++  id = raw_id;
++  return true;
++}
++
++// ФАЛЬСИФИКАТОР (только для доказательства дефекта, НЕ для боя). VLLM_GPTQ_FOLD_LEGACY:
++//   не задано / "0"  -- боевой режим: граница прохода по (I1), проверки включены;
++//   "1"              -- ПРЕЖНЯЯ детекция (флаг in_capture) И проверки ВЫКЛЮЧЕНЫ.
++//                       Это дефект #92 дословно: два прохода, захваченные подряд,
++//                       сливаются в один -> второй граф без узла обнуления -> молча
++//                       неверные числа. ОТРИЦАТЕЛЬНЫЙ КОНТРОЛЬ;
++//   "check"          -- ПРЕЖНЯЯ детекция, но проверки ВКЛЮЧЕНЫ. То же нарушение, но
++//                       теперь оно даёт внятный ОТКАЗ: страж живой, а не декоративный.
++// Оба falsifier-режима нужны в ОДНОМ бинарнике: иначе "до" и "после" -- две разные
++// сборки, и сравнение ничего не доказывает.
++//   "graph"          -- граница по ИДЕНТИФИКАТОРУ ЗАХВАТА (ошибка 2 из шапки),
++//                       проверки выключены. Числа верные, но узел обнуления всей
++//                       плиты ложится в КАЖДЫЙ кусок разбитого графа. Нужен, чтобы
++//                       ЦЕНУ этой ошибки можно было замерить в ОДНОМ бинарнике.
++enum LegacyMode { LM_OFF, LM_BUG, LM_BUG_CHECKED, LM_GRAPH };
++LegacyMode fold_legacy_mode() {
++  static const LegacyMode v = [] {
++    const char* e = std::getenv("VLLM_GPTQ_FOLD_LEGACY");
++    if (!e || !*e || *e == '0') return LM_OFF;
++    if (!std::strcmp(e, "check")) return LM_BUG_CHECKED;
++    if (!std::strcmp(e, "graph")) return LM_GRAPH;
++    return LM_BUG;
++  }();
++  return v;
++}
++
++// E, закреплённый снаружи. 0/пусто -- выучить на первом проходе (и сказать об этом
++// вслух: первый проход при обучении защищён только (I5)).
++int fold_expect_env() {
++  static const int v = [] {
++    const char* e = std::getenv("VLLM_GPTQ_FOLD_EXPECT");
++    return (e && *e) ? atoi(e) : 0;
++  }();
++  return v;
++}
++
++// Сколько байт плиты проход ДЕЙСТВИТЕЛЬНО занимает при данном m. Обнулять больше
++// нечего: хвост за этой границей этот проход не читает, а проход с бо'льшим m занулит
++// свой больший префикс сам. Это снимает связь между ЁМКОСТЬЮ плиты и ЦЕНОЙ обнуления:
++// замерено, что узел обнуления стоит ровно (байты / 835 ГБ/с), то есть 1.2 мкс на МБ,
++// и при плите 40 МБ он съедал 37 мкс на КАЖДОМ токене, даже при B=1, где нужно 4.06 МБ.
++size_t fold_pass_bytes(int m) {
++  if (g_zslab.zero_m == m) return g_zslab.zero_bytes;
++  size_t total = 0;
++  for (int width : g_zslab.ref) {
++    total += ((size_t)m * (size_t)width * 2 + 511) & ~(size_t)511;
++    if (total >= g_zslab.bytes) {
++      total = g_zslab.bytes;
++      break;
++    }
++  }
++  g_zslab.zero_m = m;
++  g_zslab.zero_bytes = total;
++  return total;
++}
++
++// ФАЛЬСИФИКАТОР: вернуть обнуление ВСЕЙ плиты (как было), чтобы цена префикса мерилась
++// в одном бинарнике.
++bool fold_zero_all() {
++  static const bool v = [] {
++    const char* e = std::getenv("VLLM_GPTQ_FOLD_ZERO_ALL");
++    return e && *e && *e != '0';
++  }();
++  return v;
++}
++
++// (I5) наименьший период последовательности. Если он делит длину и меньше её --
++// последовательность есть повтор, то есть в один "проход" слиплось несколько.
++int fold_min_period(const std::vector<int>& v) {
++  const int n = static_cast<int>(v.size());
++  for (int p = 1; p < n; ++p) {
++    if (n % p) continue;
++    bool ok = true;
++    for (int i = p; i < n && ok; ++i) ok = (v[i] == v[i - p]);
++    if (ok) return p;
++  }
++  return n;
++}
++
++// Закрыть проход: напечатать, проверить длину, приготовить следующий.
++void fold_close_pass(bool checks) {
++  if (!g_zslab.open) return;
++  const int n = g_zslab.pos;
++  fprintf(stderr,
++          "[fa2_sm70] fold: проход %lld закрыт%s: умножений %d (слотов %d, откатов "
++          "по ёмкости %d), графов %d, m=%d, обнулено %zu КБ\n",
++          g_zslab.passes,
++          (g_zslab.ref_ready || g_zslab.slots) ? "" : " [НАБЛЮДЕНИЕ, без свёртки]", n,
++          g_zslab.slots, g_zslab.fb_cap, g_zslab.pieces, g_zslab.m_cur,
++          g_zslab.zeroed_now >> 10);
++  g_zslab.passes++;
++  if (checks && g_zslab.expect > 0) {
++    STD_TORCH_CHECK(
++        n == g_zslab.expect,
++        "[fa2_sm70] fold: ИНВАРИАНТ ПРОХОДА НАРУШЕН. Проход закрылся на ", n,
++        " умножениях, а проход модели -- ", g_zslab.expect,
++        ". Значит граница прохода определена неверно, и плита либо делится между "
++        "двумя токенами, либо не обнуляется вовсе -> МОЛЧА НЕВЕРНЫЕ ЧИСЛА. Отказ "
++        "вместо отката. Отключите свёртку: VLLM_GPTQ_ZERO_C=1");
++  }
++  if (checks && !g_zslab.ref_ready && n > 0) {
++    // Первый проход закрылся сам (вызовом вне захвата) -- он и есть эталон.
++    const int period = fold_min_period(g_zslab.ref);
++    STD_TORCH_CHECK(
++        period == n,
++        "[fa2_sm70] fold: обучение отравлено. Выученная последовательность длины ", n,
++        " имеет период ", period, ", то есть в один проход слиплось ", n / period,
++        " прохода: между ними не случилось ни одного умножения вне графа. Закрепите "
++        "длину прохода явно (VLLM_GPTQ_FOLD_EXPECT=<число умножений на токен>) или "
++        "отключите свёртку: VLLM_GPTQ_ZERO_C=1");
++    g_zslab.expect = n;
++    g_zslab.ref_ready = true;
++    fprintf(stderr,
++            "[fa2_sm70] fold: длина прохода ВЫУЧЕНА = %d умножений. Первый проход "
++            "прошёл без сверки; чтобы закрыть и его, задайте "
++            "VLLM_GPTQ_FOLD_EXPECT=%d\n",
++            n, n);
++  }
++  g_zslab.open = false;
++  g_zslab.pos = 0;
++  g_zslab.slots = 0;
++  g_zslab.fb_cap = 0;
++  g_zslab.bump = 0;
++  g_zslab.zeroed = false;
++  g_zslab.zeroed_graph_prev = g_zslab.graph_zero;
++  g_zslab.graph_zero = 0;
++  g_zslab.pieces = 0;
++  g_zslab.graph_last = 0;
++  g_zslab.m_cur = 0;
++}
++
++// Проход длиной E закрывается СРАЗУ на своём E-м умножении.
++void fold_maybe_close(bool by_count, bool checks) {
++  if (!by_count) return;  // при прежней детекции границу ставит только выход из графа
++  if (g_zslab.expect > 0 && g_zslab.pos >= g_zslab.expect) fold_close_pass(checks);
++}
++
++// НАБЛЮДЕНИЕ: собрать эталон прохода, не выдавая слотов. Первый проход идёт обычным
++// путём (new_zeros) -- цена этого одна на подъём, зато обучение не может испортить
++// числа: пока эталона нет, свёртки нет.
++void fold_observe(int64_t m, int64_t n, bool checks) {
++  if (!g_zslab.open) {
++    g_zslab.open = true;
++    g_zslab.m_cur = static_cast<int>(m);
++    g_zslab.ref.clear();
++  }
++  if (static_cast<int>(m) != g_zslab.m_cur) {
++    // Наблюдение НИЧЕМ не рискует (свёртки ещё нет), поэтому помеха его перезапускает,
++    // а не роняет сервер. Если эталон так и не соберётся, механизм просто не включится
++    // -- и это видно в логе, а числа остаются верными.
++    if (!g_zslab.warned_observe) {
++      g_zslab.warned_observe = true;
++      fprintf(stderr,
++              "[fa2_sm70] fold: наблюдение прохода перезапущено (умножение %d пришло "
++              "с m=%d, а проход шёл с m=%d). Пока эталон не собран, свёртки нет.\n",
++              g_zslab.pos, static_cast<int>(m), g_zslab.m_cur);
++    }
++    g_zslab.ref.clear();
++    g_zslab.pos = 0;
++    g_zslab.m_cur = static_cast<int>(m);
++  }
++  g_zslab.ref.push_back(static_cast<int>(n));
++  g_zslab.pos++;
++  if (g_zslab.expect > 0 && static_cast<int>(g_zslab.ref.size()) >= g_zslab.expect)
++    g_zslab.ref_ready = true;
++  fold_maybe_close(true, checks);
++}
++}  // namespace
++
++// Плиту строим ТОЛЬКО вне захвата (cudaMalloc при захвате запрещён), поэтому зовём это
++// на КАЖДОМ вызове gptq_gemm, а не только на квантованной ветке: профилировочный прогон
++// vLLM идёт по ветке reconstruct, и если ждать первого квантованного вызова вне графа,
++// плиты может не оказаться к моменту захвата -- режим тихо не включится.
++void fold_maybe_init() {
++  if (g_zslab.tried) return;
++  cudaStream_t stream = get_current_cuda_stream();
++  cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
++  if (cudaStreamIsCapturing(stream, &st) != cudaSuccess) return;
++  if (st == cudaStreamCaptureStatusActive) return;
++  g_zslab.tried = true;
++  const char* mb = std::getenv("VLLM_GPTQ_FOLD_MB");
++  size_t want = (size_t)((mb && *mb) ? atoi(mb) : 8) << 20;
++  int dev = -1;
++  cudaError_t derr = cudaGetDevice(&dev);
++  STD_TORCH_CHECK(derr == cudaSuccess, "[fa2_sm70] fold: cudaGetDevice failed: ",
++                  cudaGetErrorString(derr));
++  const int pin = fold_expect_env();
++  if (pin > 0) {
++    g_zslab.expect = pin;
++    g_zslab.pinned = true;
++  }
++  if (cudaMalloc(&g_zslab.base, want) == cudaSuccess &&
++      cudaMemset(g_zslab.base, 0, want) == cudaSuccess) {
++    g_zslab.bytes = want;
++    g_zslab.device = dev;  // (I4) плита привязана к устройству
++    fprintf(stderr,
++            "[fa2_sm70] fold: плита %zu МБ готова (устройство %d, длина прохода %s)\n",
++            want >> 20, dev, g_zslab.pinned ? "закреплена" : "будет выучена");
++  } else {
++    g_zslab.base = nullptr;
++    fprintf(stderr, "[fa2_sm70] fold: плита %zu МБ НЕ выделена, откат\n", want >> 20);
++  }
++}
++
++// Возвращает тензор из плиты (ok=true) либо пустой тензор (ok=false -> обычный путь).
++// ok=false бывает вне захвата графа, при нехватке ёмкости (I3), при чужом устройстве
++// (I4) и если плиты нет вовсе. Нарушение инварианта прохода -- ОТКАЗ, а не откат.
++torch::stable::Tensor fold_take_slot(const torch::stable::Tensor& like, int64_t m,
++                                     int64_t n, bool& ok) {
++  ok = false;
++  const LegacyMode legacy = fold_legacy_mode();
++  const bool checks = (legacy == LM_OFF || legacy == LM_BUG_CHECKED);
++  cudaStream_t stream = get_current_cuda_stream();
++
++  // --- 0. (I4) чужое устройство -- НЕ трогаем состояние вообще. ------------
++  // Плита живёт на той карте, где первым позвали cudaMalloc, а options берутся у
++  // входного тензора: на другой карте это был бы указатель в чужую память. Числа при
++  // отказе от свёртки остаются верными (обычный путь), поэтому здесь ОТКАТ, а не
++  // отказ; но откат считается и один раз кричит в лог.
++  if (checks && g_zslab.base) {
++    int cur = -1;
++    const int want_dev = static_cast<int>(like.get_device_index());
++    if (cudaGetDevice(&cur) != cudaSuccess) cur = -1;
++    if (want_dev != g_zslab.device || cur != g_zslab.device) {
++      g_zslab.fb_device++;
++      if (!g_zslab.warned_device) {
++        g_zslab.warned_device = true;
++        fprintf(stderr,
++                "[fa2_sm70] fold: вызов на устройстве %d (текущее %d), а плита на %d "
++                "-> НЕ сворачиваем (обычный путь, числа верны). Свёртка рассчитана "
++                "на один процесс = одно устройство; при спекулятивном декоде на "
++                "второй карте в том же процессе выигрыш там просто не берётся.\n",
++                want_dev, cur, g_zslab.device);
++      }
++      return torch::stable::Tensor();
++    }
++  }
++
++  // --- 1. Активен ли захват. ----------------------------------------------
++  // (наблюдение первого прохода -- ниже: пока эталон не собран, слоты НЕ выдаются)
++  cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
++  unsigned long long id = 0;
++  if (legacy == LM_BUG) {
++    // прежняя версия спрашивала только статус, id не спрашивала вовсе
++    if (cudaStreamIsCapturing(stream, &st) != cudaSuccess)
++      return torch::stable::Tensor();
++  } else {
++    if (fold_capture_id(stream, id)) st = cudaStreamCaptureStatusActive;
++  }
++
++  const bool observing = checks && !g_zslab.ref_ready && g_zslab.base != nullptr;
++  if (st != cudaStreamCaptureStatusActive) {
++    // Вне графа сворачивать нечего (смещения не зафиксированы), и это же --
++    // естественная граница прохода: закрываем открытый.
++    // ИСКЛЮЧЕНИЕ: при ЗАКРЕПЛЁННОМ E эталон собирается прямо здесь, на прогонах вне
++    // графа (vLLM делает их перед захватом). Тогда к первому же захвату эталон готов
++    // и сворачивается ВСЁ. Без закрепления эталон собрать вне графа нечем -- проход
++    // там нечем закрыть, -- и он собирается на первом ЗАХВАЧЕННОМ проходе.
++    if (observing && g_zslab.pinned && legacy != LM_BUG) {
++      fold_observe(m, n, checks);
++      return torch::stable::Tensor();
++    }
++    if (legacy == LM_BUG) {
++      if (g_zslab.in_capture)
++        fprintf(stderr, "[fa2_sm70] fold: захват закончен, слотов %d, откатов %d\n",
++                g_zslab.slots, g_zslab.fb_cap);
++      g_zslab.in_capture = false;
++      g_zslab.open = false;
++      g_zslab.pos = g_zslab.slots = g_zslab.fb_cap = 0;
++      g_zslab.bump = 0;
++      g_zslab.zeroed = false;
++    } else {
++      fold_close_pass(checks);
++    }
++    return torch::stable::Tensor();
++  }
++  g_zslab.in_capture = true;
++  if (!g_zslab.base) return torch::stable::Tensor();
++
++  if (observing) {
++    // ПЕРВЫЙ проход только измеряется: ни слотов, ни узла обнуления. Тогда обучение
++    // не может дать неверных чисел даже в самом плохом расписании захватов -- худшее,
++    // что бывает, это "механизм не включился", и это видно в логе.
++    fold_observe(m, n, checks);
++    return torch::stable::Tensor();
++  }
++
++  // --- 2. Начало прохода. --------------------------------------------------
++  // ПРЕЖНЯЯ детекция (LEGACY): проход кончается только вызовом ВНЕ захвата -- два
++  //   прохода, захваченные подряд, сливаются (дефект #92).
++  // ТЕКУЩАЯ детекция: проход кончается на своём E-м умножении (закрывается ниже, на
++  //   месте) ; разбиение графа на куски проход НЕ делит.
++  if (legacy == LM_GRAPH && g_zslab.open && id != g_zslab.graph_last) {
++    fold_close_pass(false);  // ФАЛЬСИФИКАТОР: граница по графу, а не по проходу
++  }
++  if (!g_zslab.open) {
++    if (legacy == LM_OFF && g_zslab.zeroed_graph_prev == id &&
++        !g_zslab.warned_same_graph) {
++      g_zslab.warned_same_graph = true;
++      fprintf(stderr,
++              "[fa2_sm70] fold: ВНИМАНИЕ, в ОДИН граф %llu попало больше одного "
++              "прохода. Тогда второй узел обнуления затирает выходы первого прохода "
++              "ВНУТРИ одного воспроизведения; это верно, только если те выходы к "
++              "тому моменту уже прочитаны. Такая топология не проверялась -- сверьте "
++              "числа или отключите свёртку: VLLM_GPTQ_ZERO_C=1\n",
++              id);
++    }
++    g_zslab.open = true;
++    g_zslab.m_cur = static_cast<int>(m);
++    if (!g_zslab.ref_ready) g_zslab.ref.clear();
++  }
++  if (id != g_zslab.graph_last) {
++    g_zslab.graph_last = id;
++    g_zslab.pieces++;
++  }
++
++  // --- 3. (I1) k-е умножение прохода обязано быть тем же самым. ------------
++  const int k = g_zslab.pos;
++  if (checks) {
++    STD_TORCH_CHECK(static_cast<int>(m) == g_zslab.m_cur,
++                    "[fa2_sm70] fold: ИНВАРИАНТ ПРОХОДА НАРУШЕН. Умножение ", k,
++                    " пришло с m=", static_cast<int>(m), ", а проход идёт с m=",
++                    g_zslab.m_cur,
++                    ". Границу прохода определить нечем -> ОТКАЗ. Отключите "
++                    "свёртку: VLLM_GPTQ_ZERO_C=1");
++    // Сюда попадают только проходы ПОСЛЕ наблюдения: пока эталона нет, слоты не
++    // выдаются вовсе (см. fold_observe выше).
++    STD_TORCH_CHECK(g_zslab.ref_ready,
++                    "[fa2_sm70] fold: слот выдаётся до того, как собран эталон "
++                    "прохода -- внутренняя ошибка порядка проверок");
++    {
++      STD_TORCH_CHECK(
++          k < static_cast<int>(g_zslab.ref.size()),
++          "[fa2_sm70] fold: ИНВАРИАНТ ПРОХОДА НАРУШЕН. Умножение ", k,
++          " выходит за длину прохода ", static_cast<int>(g_zslab.ref.size()),
++          ": в один проход слиплось несколько (два графа захвачены подряд?), плита "
++          "делится между токенами -> МОЛЧА НЕВЕРНЫЕ ЧИСЛА. Отказ вместо отката. "
++          "Отключите свёртку: VLLM_GPTQ_ZERO_C=1");
++      STD_TORCH_CHECK(
++          g_zslab.ref[k] == static_cast<int>(n),
++          "[fa2_sm70] fold: ИНВАРИАНТ ПРОХОДА НАРУШЕН. Умножение ", k,
++          " прохода имеет ширину ", static_cast<int>(n), ", а эталон прохода -- ",
++          g_zslab.ref[k],
++          ". Последовательность умножений токена изменилась: проход потерял или "
++          "добавил умножения, либо в тот же процесс вклинилась другая модель. Плита "
++          "тогда делится не так, как при захвате -> МОЛЧА НЕВЕРНЫЕ ЧИСЛА. Отключите "
++          "свёртку: VLLM_GPTQ_ZERO_C=1");
++    }
++  }
++
++  // --- 4. (I3) слот должен влезть. ----------------------------------------
++  // ЭТО НЕ НАРУШЕНИЕ ИНВАРИАНТА, а ёмкость: не влез -- уходим на new_zeros, что
++  // ЧИСЛЕННО ВЕРНО, просто без выигрыша. Отказывать здесь НЕЛЬЗЯ: при B>1 частичная
++  // свёртка -- штатный режим (по боевому логу 232/116/59 слотов из 236 при B=2/4/8 и
++  // плите 8 МБ). Но откат перестаёт быть ТИХИМ: он считается, печатается на закрытии
++  // прохода и занимает свою позицию k.
++  const size_t need = ((size_t)m * (size_t)n * 2 + 511) & ~(size_t)511;
++  if (g_zslab.bump + need > g_zslab.bytes) {
++    g_zslab.fb_cap++;
++    g_zslab.pos++;
++    fold_maybe_close(legacy == LM_OFF, checks);
++    return torch::stable::Tensor();
++  }
++
++  // --- 5. (I2) узел обнуления -- ровно один и ровно в начале прохода. ------
++  char* p = static_cast<char*>(g_zslab.base) + g_zslab.bump;
++  const bool first = (legacy == LM_BUG) ? (g_zslab.pos == 0) : !g_zslab.zeroed;
++  if (first) {
++    const size_t zbytes = (g_zslab.ref_ready && !fold_zero_all())
++                              ? fold_pass_bytes(static_cast<int>(m))
++                              : g_zslab.bytes;
++    cudaError_t merr = cudaMemsetAsync(g_zslab.base, 0, zbytes, stream);
++    STD_TORCH_CHECK(merr == cudaSuccess,
++                    "[fa2_sm70] fold: cudaMemsetAsync не встал в граф: ",
++                    cudaGetErrorString(merr), " -> ОТКАЗ");
++    g_zslab.zeroed = true;
++    g_zslab.graph_zero = id;
++    g_zslab.zeroed_now = zbytes;
++  }
++  if (checks) {
++    STD_TORCH_CHECK(
++        g_zslab.zeroed, "[fa2_sm70] fold: ИНВАРИАНТ ПРОХОДА НАРУШЕН. Слот ", k,
++        " выдаётся в проходе, в который НЕ поставлен узел обнуления плиты. Такой "
++        "граф при воспроизведении кладёт atomicAdd поверх выхода предыдущего токена "
++        "-> МОЛЧА НЕВЕРНЫЕ ЧИСЛА. Отказ вместо отката. Отключите свёртку: "
++        "VLLM_GPTQ_ZERO_C=1");
++  }
++
++  g_zslab.bump += need;
++  g_zslab.pos++;
++  g_zslab.slots++;
++  g_zslab.folded++;
++  ok = true;
++  const int64_t sizes[2] = {m, n};
++  const int64_t strides[2] = {n, 1};
++  torch::stable::Tensor out = torch::stable::from_blob(
++      p, torch::headeronly::IntHeaderOnlyArrayRef(sizes, 2),
++      torch::headeronly::IntHeaderOnlyArrayRef(strides, 2), like.device(),
++      like.scalar_type());
++  // Проход закрываем НА МЕСТЕ, на его E-м умножении, а не по приходу следующего:
++  // тогда проверен КАЖДЫЙ проход, включая последний захваченный (после него вызовов
++  // может уже не быть -- воспроизведение графа в хост не заходит).
++  fold_maybe_close(legacy == LM_OFF, checks);
++  return out;
++}
++
+ }  // namespace gptq
+ }  // namespace vllm
+
+@@ -1832,7 +2407,42 @@ torch::stable::Tensor gptq_gemm(torch::stable::Tensor a,
+                                 bool use_v2_format, int64_t bit) {
+   const torch::stable::accelerator::DeviceGuard device_guard(
+       a.get_device_index());
+-  auto c = torch::stable::new_zeros(a, {a.size(0), b_q_weight.size(1)});
++  // [fa2_sm70 / ПАРА-1] Режимы обнуления C. Значение VLLM_GPTQ_ZERO_C:
++  //   (не задано) / "0"  -- пропустить обнуление ТОЛЬКО на пути reconstruct
++  //                         (там cublasHgemm с beta = 0 не читает C);
++  //   "1" (любое иное)   -- обнулять всегда (исходное поведение vLLM);
++  //   "never"            -- НИКОГДА не обнулять. ЧИСЛЕННО НЕВЕРНО на пути atomicAdd,
++  //                         это ФАЛЬСИФИКАТОР: снимает ровно N узлов графа на токен,
++  //                         не меняя ни одного байта прочей работы -> ПОТОЛОК выигрыша;
++  //   "fold"             -- ПАССАЖИР: C декодных умножений берётся из постоянной плиты,
++  //                         и вся плита зануляется ОДНИМ узлом cudaMemsetAsync на токен
++  //                         (N ядер -> 1 узел). Работает только внутри захвата графа.
++  enum ZeroMode { ZM_DEFAULT, ZM_ALWAYS, ZM_NEVER, ZM_FOLD };
++  static const ZeroMode zmode = [] {
++    const char* e = std::getenv("VLLM_GPTQ_ZERO_C");
++    if (!e || !*e) return ZM_DEFAULT;
++    if (!std::strcmp(e, "never")) return ZM_NEVER;
++    if (!std::strcmp(e, "fold")) return ZM_FOLD;
++    if (*e == '0') return ZM_DEFAULT;
++    return ZM_ALWAYS;
++  }();
++
++  const bool uses_reconstruct = vllm::gptq::gptq_gemm_uses_reconstruct(
++      static_cast<int>(a.size(0)), use_exllama, static_cast<int>(bit));
++  bool no_zero_needed = (zmode != ZM_ALWAYS) && uses_reconstruct;
++  if (zmode == ZM_NEVER) no_zero_needed = true;
++
++  torch::stable::Tensor c;
++  bool c_ready = false;
++  if (zmode == ZM_FOLD) vllm::gptq::fold_maybe_init();
++  if (zmode == ZM_FOLD && !uses_reconstruct) {
++    c = vllm::gptq::fold_take_slot(a, a.size(0), b_q_weight.size(1), c_ready);
++  }
++  if (!c_ready) {
++    c = no_zero_needed
++            ? torch::stable::new_empty(a, {a.size(0), b_q_weight.size(1)})
++            : torch::stable::new_zeros(a, {a.size(0), b_q_weight.size(1)});
++  }
+   auto temp_dq =
+       torch::stable::empty({b_q_weight.size(0) * 32 / bit, b_q_weight.size(1)},
+                            a.scalar_type(), std::nullopt, a.device());
