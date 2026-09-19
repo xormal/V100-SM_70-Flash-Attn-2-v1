@@ -99,7 +99,9 @@ __global__ __launch_bounds__(WM * WN * 32, MINB ? MINB : 1) void k_fwd(const __h
   // XOR-свизл меняет РАСКЛАДКУ sQ, а пути предзагрузки (QREG/QPRE) и конвейера читают её обычной
   // адресацией. Сочетание молча даёт неверный результат (relL2 1e-01). Третий случай подряд, когда
   // несовместимость шаблонных параметров проявляется как «геометрия не работает» — запрещаем статически.
-  static_assert(!SWZ || (!QREG && !QPRE && !PIPE), "свизл несовместим с предзагрузкой Q и конвейером");
+  // [11.09] свизл Q (в shared) совместим с конвейером K (PIPE): они про разные операнды.
+  // Несовместим лишь с Q-в-регистрах (QREG/QPRE).
+  static_assert(!SWZ || (!QREG && !QPRE), "свизл несовместим с предзагрузкой Q в регистры");
   constexpr int kStage = PIPE ? (BK * D / 8) / (WM * WN * 32) : 1;
   // [ДОЗИРОВАННЫЙ КОНВЕЙЕР] Конвейер был «всё или ничего»: либо ВСЕ kStage векторов плитки идут через
   // регистры, либо ни один. Замер налога: BQ=32/4 варпа 124 -> 168 (+44), BQ=16/2 варпа 124 -> 234
@@ -190,7 +192,6 @@ __global__ __launch_bounds__(WM * WN * 32, MINB ? MINB : 1) void k_fwd(const __h
       }
       if constexpr (QREG)      s.template accumulate_pre<D>(qfrag, sKc, LDK, wn * SN, lane);
       else if constexpr (QPRE) s.template accumulate_part<D, QPRE>(qfrag, sQ, LDQ, wm * SM, sKc, LDK, wn * SN, lane);
-      else if constexpr (WIDE)  s.template accumulate_w<D>(sQ, LDQ, wm * SM, sKc, LDK, wn * SN, lane);
       else                     s.template accumulate<D>(sQ, LDQ, wm * SM, sKc, LDK, wn * SN, lane);
     } else if constexpr (PIPE == 3) {
       // [softDMA НА ОСИ КУСКОВ] Прежний цикл кусков чередовал строго: sync -> LDG+STS -> sync -> mma.
@@ -223,7 +224,10 @@ __global__ __launch_bounds__(WM * WN * 32, MINB ? MINB : 1) void k_fwd(const __h
           }
         }
         // QPRE здесь НЕ применим: qfrag держит k-шаги 0..QPRE-1 ПОЛНОГО D, а не текущего куска dc.
-        s.template accumulate<DC>(sQ + dc, LDQ, wm * SM, sK, LDK, wn * SN, lane);
+        if constexpr (SWZ)
+          s.template accumulate_swzA_dc<DC>(sQ, LDQ, wm * SM, dc, sK, LDK, wn * SN, lane);
+        else
+          s.template accumulate<DC>(sQ + dc, LDQ, wm * SM, sK, LDK, wn * SN, lane);
       }
     } else {
 #pragma unroll
@@ -238,8 +242,8 @@ __global__ __launch_bounds__(WM * WN * 32, MINB ? MINB : 1) void k_fwd(const __h
           *reinterpret_cast<uint2*>(pk + 4) = make_uint2(gk.z, gk.w);
         }
         __syncthreads();
-        if constexpr (SWZ && DC == D)
-          s.template accumulate_swzA<DC>(sQ, LDQ, wm * SM, sK, LDK, wn * SN, lane);
+        if constexpr (SWZ)
+          s.template accumulate_swzA_dc<DC>(sQ, LDQ, wm * SM, dc, sK, LDK, wn * SN, lane);
         else
           s.template accumulate<DC>(sQ + dc, LDQ, wm * SM, sK, LDK, wn * SN, lane);
       }

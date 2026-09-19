@@ -76,12 +76,16 @@ __device__ __forceinline__ float kkt_ex2(float x) {
 // WM x WN -- сетка варпов по грам-матрице. SKIP_UPPER -- не писать шесть СТРОГО ВЕРХНИХ блоков 16x16
 // (их единственный потребитель solve_tril не читает никогда; диагональные блоки читает ЦЕЛИКОМ, там
 // нули обязаны лежать явно). По умолчанию выключено: это меняет контракт выхода.
-template <int BT, int DK, int GQ, int WM, int WN, bool SKIP_UPPER = false>
+// AT -- тип выходной Araw (задача 131). Ядро УПИРАЕТСЯ В ЗАПИСЬ A (96.3 МБ из 128), поэтому
+// AT=__half режет главный трафик вдвое. Точность: |Araw| <= 1 (строки k нормированы, beta<1,
+// e^{g_i-g_j} <= 1 в нижнем треугольнике), а ошибку ПУТИ задаёт округление Ai (fp16 на выходе
+// solve_tril) -- это уже замерено в его шапке («чтение в fp32 ради точности не даёт ничего»).
+template <int BT, int DK, int GQ, int WM, int WN, bool SKIP_UPPER = false, typename AT = float>
 __global__ __launch_bounds__(WM * WN * 32, 1) void volta_gdn_kkt(
     const __half* __restrict__ k,      // [T, Hg, DK]      fp16, строки единичной нормы
     const __half* __restrict__ beta,   // [T, H]           fp16, sigmoid -> (0,1)
     const float* __restrict__ g,       // [T, H]           fp32, накопленный ВНУТРИ чанка лог-гейт
-    float* __restrict__ A,             // [T, H, BT]       fp32, выход
+    AT* __restrict__ A,                // [T, H, BT]       fp32 или fp16, выход
     const int* __restrict__ cu_seqlens,      // [N+1] или nullptr (одна последовательность с bos=0)
     const int* __restrict__ chunk_indices,   // [NT][2] или nullptr (чанк = blockIdx.x)
     int T, int H, int Hg) {
@@ -200,7 +204,16 @@ __global__ __launch_bounds__(WM * WN * 32, 1) void volta_gdn_kkt(
     o.y = (r > c0 + 1 && c0 + 1 < rows) ? v.y * rb * kkt_ex2(gi - gc[1]) : 0.f;
     o.z = (r > c0 + 2 && c0 + 2 < rows) ? v.z * rb * kkt_ex2(gi - gc[2]) : 0.f;
     o.w = (r > c0 + 3 && c0 + 3 < rows) ? v.w * rb * kkt_ex2(gi - gc[3]) : 0.f;
-    *reinterpret_cast<float4*>(&A[((long)(bos + t0 + r) * H + h0 + hq) * BT + c0]) = o;
+    if constexpr (sizeof(AT) == 2) {
+      // fp16-выход: та же четвёрка столбцов уезжает одной записью 8 Б -- строка группы остаётся
+      // сплошной (GQ*BT*2 = 384 Б = 3 сектора), трафик записи вдвое меньше.
+      const __half2 lo = __floats2half2_rn(o.x, o.y), hi = __floats2half2_rn(o.z, o.w);
+      const uint2 pk = {*reinterpret_cast<const uint32_t*>(&lo),
+                        *reinterpret_cast<const uint32_t*>(&hi)};
+      *reinterpret_cast<uint2*>(&A[((long)(bos + t0 + r) * H + h0 + hq) * BT + c0]) = pk;
+    } else {
+      *reinterpret_cast<float4*>(&A[((long)(bos + t0 + r) * H + h0 + hq) * BT + c0]) = o;
+    }
   }
 }
 

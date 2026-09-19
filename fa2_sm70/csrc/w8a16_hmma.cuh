@@ -36,10 +36,18 @@ using fa2_sm70::WarpMma;
 using fa2_sm70::BLayout;
 
 // BN -- столбцов выхода на блок; WN -- варпов по N; G -- размер группы GPTQ (обычно 128).
-template <int BN, int WN, int G>
+// [РАСЩЕПЛЕНИЕ ПО K -- ГЛАВНОЕ, ЧЕГО ЗДЕСЬ НЕ ХВАТАЛО ДЛЯ УЗКИХ ФОРМ]
+// Замер 26.08: на `down 8704x5120` (N=5120) сетка без расщепления это (N/BN, M/16) = (80, 1) --
+// РОВНО 80 блоков на 80 SM, то есть один блок на SM и ноль запаса на укрытие латентности. Полоса
+// выходит 150-250 ГБ/с при достижимых 780. У соседнего `w8a16_gemv` расщепление есть, и он на той
+// же форме даёт 668 ГБ/с при M=1 -- разница не в теле, а в ЗАПОЛНЕНИИ МАШИНЫ.
+// Расщепление добавлено третьим измерением сетки; при ksplit>1 блоки складываются атомарно в
+// площадку fp32, потом один проход приводит её к fp16 (тот же приём и та же площадка, что у gemv).
+template <int BN, int WN, int G, bool SPLIT = false>
 __global__ __launch_bounds__(WN * 32) void w8a16_hmma(
     const __half* __restrict__ x, const int* __restrict__ qweight, const int* __restrict__ qzeros,
-    const __half* __restrict__ scales, __half* __restrict__ y, int M, int N, int K) {
+    const __half* __restrict__ scales, __half* __restrict__ y, int M, int N, int K, float zbias,
+    float* __restrict__ ypart = nullptr, int groups_per_split = 0) {
   constexpr int MT = 16;                       // одна плитка HMMA по M (m8n8k4 -> кратно 16)
   constexpr int NBw = (BN / WN) / 16;          // блоков 16 столбцов на варп
   // [РАЗНЫЕ ДОПОЛНЕНИЯ ДЛЯ sA И sB -- ОДНО НА ОБА БЫЛО КОМПРОМИССОМ, А НЕ ВЫБОРОМ]
@@ -59,7 +67,13 @@ __global__ __launch_bounds__(WN * 32) void w8a16_hmma(
   static_assert(G % 4 == 0, "группа кратна 4 (шаг k у HMMA)");
 
   __shared__ __half sA[MT * LDA];               // x: [MT][G]   k-мажорный
-  __shared__ __half sB[G * LDB];                // вес: [G][BN] n-мажорный (распакованный, 1024+q)
+  // [ПОЛОВИНА ГРУППЫ В РАЗДЕЛЯЕМОЙ -- ЭТО ЗАНЯТОСТЬ, А НЕ ЭКОНОМИЯ]
+  // Замер: при sB на всю группу разделяемая выходит 24.7 КиБ, и на SM помещается ТРИ блока по
+  // четыре варпа -- двенадцать варпов из шестидесяти четырёх. Полоса при этом 240-290 ГБ/с при
+  // крыше 780. Половина группы даёт 15 КиБ и шесть блоков, то есть вдвое больше теней. Плата --
+  // один лишний барьер на группу; масштаб группы применяется как и был, ПОСЛЕ обеих половин.
+  constexpr int GH = G / 2;
+  __shared__ __half sB[GH * LDB];               // вес: [G/2][BN] n-мажорный (распакованный, 1024+q)
   __shared__ float sSx[MT];                     // sum x по группе, на строку
   __shared__ float sS[BN], sZ[BN];               // масштаб и нуль группы -- ОДИН раз, не на элемент
 
@@ -75,7 +89,10 @@ __global__ __launch_bounds__(WN * 32) void w8a16_hmma(
 #pragma unroll
     for (int r = 0; r < 8; ++r) acc[j][r] = 0.f;
 
-  for (int g0 = 0; g0 < K; g0 += G) {
+  const int kbeg = SPLIT ? blockIdx.z * groups_per_split * G : 0;
+  const int kend = SPLIT ? min(K, kbeg + groups_per_split * G) : K;
+  if (kbeg >= kend) return;
+  for (int g0 = kbeg; g0 < kend; g0 += G) {
     const int g = g0 / G;
     __syncthreads();
     // --- x группы в smem + сумма по строке ------------------------------------------------------
@@ -92,26 +109,55 @@ __global__ __launch_bounds__(WN * 32) void w8a16_hmma(
       if (r < mrows) for (int c = 0; c < G; ++c) sx += __half2float(sA[r * LDA + c]);
       sSx[r] = sx;
     }
-    // --- вес: ОДИН OR на байт, ни одной конверсии ------------------------------------------------
-    for (int i = tid; i < (G / 4) * BN; i += WN * 32) {
-      const int kq = i / BN, n = i - kq * BN;             // kq -- индекс int32 внутри группы
+    // [ЧЕТЫРЕ СТОЛБЦА ОДНОЙ LDG.128 -- ТО ЖЕ, ЧТО СДЕЛАНО В gemv4]
+    // Было: одна LDG.32 на нить, шестнадцать штук на группу, и шестнадцать СКАЛЯРНЫХ записей в
+    // разделяемую. Замер после расщепления по K показал 210-265 ГБ/с при крыше 780 -- то есть
+    // связывает уже не заполнение машины, а ШИРИНА ОБРАЩЕНИЯ. Столбцы в `qweight` лежат подряд
+    // (раскладка [K/4, N]), значит четыре соседних столбца берутся ОДНИМ int4.
+    // Запись в разделяемую тоже уплотняется: четыре половинки одного ряда идут подряд (n кратно
+    // четырём), это одна 64-битная запись вместо четырёх скалярных.
+    static_assert(BN % 4 == 0, "BN кратно 4: столбцы читаются по четыре");
+    o.clear();                                   // ОБЯЗАНО стоять ДО накопления обеих половин
+    for (int h = 0; h < 2; ++h) {
+    __syncthreads();
+    for (int i = tid; i < (GH / 4) * (BN / 4); i += WN * 32) {
+      const int kq = i / (BN / 4) + h * (GH / 4), nq = i - (i / (BN / 4)) * (BN / 4), n = nq * 4;
       const int nn = n0 + n;
-      unsigned w = (nn < N) ? (unsigned)qweight[(long)((g0 >> 2) + kq) * N + nn] : 0u;
-      __half* p = &sB[(kq * 4) * LDB + n];
+      uint4 w4;
+      if (nn + 3 < N) {
+        w4 = *reinterpret_cast<const uint4*>(qweight + (long)((g0 >> 2) + kq) * N + nn);
+      } else {
+        w4.x = w4.y = w4.z = w4.w = 0u;
+      }
+      const unsigned wc[4] = {w4.x, w4.y, w4.z, w4.w};
 #pragma unroll
-      for (int b = 0; b < 4; ++b)
-        p[b * LDB] = __ushort_as_half(0x6400u | ((w >> (b * 8)) & 0xFFu));   // = 1024 + q, ТОЧНО
+      for (int b = 0; b < 4; ++b) {
+        ushort4 hh;
+        hh.x = (ushort)(0x6400u | ((wc[0] >> (b * 8)) & 0xFFu));
+        hh.y = (ushort)(0x6400u | ((wc[1] >> (b * 8)) & 0xFFu));
+        hh.z = (ushort)(0x6400u | ((wc[2] >> (b * 8)) & 0xFFu));
+        hh.w = (ushort)(0x6400u | ((wc[3] >> (b * 8)) & 0xFFu));
+        *reinterpret_cast<ushort4*>(&sB[((kq * 4 + b) - h * GH) * LDB + n]) = hh;
+      }
+    }
+    __syncthreads();
+    o.template accumulate<GH>(sA + h * GH, LDA, 0, sB, LDB, warp * (BN / WN), lane);
     }
     // масштаб и нуль группы: по одному чтению на СТОЛБЕЦ, а не на элемент аккумулятора. В первой
     // версии они читались внутри эпилога, то есть K/G * NBw * 8 раз на нить -- это и был лимит.
     for (int c = tid; c < BN; c += WN * 32) {
       const int nn = n0 + c;
       sS[c] = (nn < N) ? __half2float(scales[(long)g * N + nn]) : 0.f;
-      sZ[c] = (nn < N) ? (float)((qzeros[(long)g * (N >> 2) + (nn >> 2)] >> ((nn & 3) * 8)) & 0xFF) : 0.f;
+      // [УСЛОВНОСТЬ НУЛЯ -- ТРЕТЬЕ МЕСТО ТОГО ЖЕ ТИХОГО ДЕФЕКТА, НАЙДЕНО 16.08.2026]
+      // GPTQ v1 (`checkpoint_format: gptq`) хранит (z-1), v2 -- сам z. Здесь читалось СЫРОЕ
+      // значение, то есть тело жило по v2, как жили `w8a16_gemv` и `fused_norm_gemv` до правки.
+      // Промах на ЕДИНИЦУ = один уровень кванта на КАЖДОМ весе (~1.4 %), без падения и без
+      // внешнего признака. Это тело не стояло на боевом пути, поэтому его пропустили: правка
+      // «по месту отказа» не закрывает КЛАСС. Условность приходит СНАРУЖИ, умолчания нет.
+      sZ[c] = (nn < N) ? (float)((qzeros[(long)g * (N >> 2) + (nn >> 2)] >> ((nn & 3) * 8)) & 0xFF)
+                             + zbias : 0.f;
     }
-    __syncthreads();
-    o.clear();
-    o.template accumulate<G>(sA, LDA, 0, sB, LDB, warp * (BN / WN), lane);
+    __syncthreads();                             // sS/sZ пишут другие нити -- читать после барьера
     // --- эпилог группы: s*(H - (1024+z)*Sx) ------------------------------------------------------
 #pragma unroll
     for (int j = 0; j < NBw; ++j)
@@ -134,7 +180,13 @@ __global__ __launch_bounds__(WN * 32) void w8a16_hmma(
       const int col = ((lane & 2) | ((lane & 4) << 1)) + (r & 1) + 4 * ((r >> 2) & 1) + j * 16
                       + warp * (BN / WN);
       const int nn = n0 + col;
-      if (nn < N && row < mrows) y[(long)(m0 + row) * N + nn] = __float2half(acc[j][r]);
+      if (nn < N && row < mrows) {
+        // [ДЕТЕРМИНИРОВАННЫЙ СВОД] Тот же ход, что в w8a16_gemv: атомарное сложение float
+        // идёт в ПОРЯДКЕ ПРИХОДА блоков и делает ответ неповторяемым между пусками.
+        // Пишем в СВОЙ слот расщепления (blockIdx.z), свод -- фиксированным порядком в эпилоге.
+        if constexpr (SPLIT) ypart[(long)blockIdx.z * M * N + (long)(m0 + row) * N + nn] = acc[j][r];
+        else                 y[(long)(m0 + row) * N + nn] = __float2half(acc[j][r]);
+      }
     }
 }
 

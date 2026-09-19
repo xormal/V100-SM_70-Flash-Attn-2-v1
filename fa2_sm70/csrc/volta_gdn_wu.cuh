@@ -86,7 +86,15 @@ namespace gdn {
 // TRI  -- укорачивать свёртку по треугольности A (ход 4).
 // MINB -- цель по блокам на SM. Второй аргумент __launch_bounds__ НЕ украшение: без него компилятор
 //         сам решает, сколько регистров оставить, и меняет решение от правки к правке (§34.2).
-template <int BT, int DK, int DV, int WM, int WN, int HPB, int MINB, bool TRI, typename IdxT>
+// DBUF -- ОСЬ ПО КАРТЕ СОЛВЕРА (задача 192, research/19 §П): факт T1=2387 против плана 1736
+//         (−27%), и карта требует STS фазы w ПОЗЖЕ (+248, в тень умножения u), а LDS -- РАНЬШЕ.
+//         В однобуферной компоновке этому мешает БАРЬЕР между store u и укладкой sA фазы w:
+//         фаза w перезаписывает ту же sA, которую ещё читает gemm(sV) других варпов. При DBUF=1
+//         фаза w пишет ВТОРУЮ копию sA -- барьер уходит, и ptxas получает ПРАВО тянуть её STS
+//         под хвост первого умножения. Цена: +BT*LDA*2 Б разделяемой (8.7 КБ) -- блок перестаёт
+//         влезать по двое на SM, поэтому ось решается СЕКУНДОМЕРОМ, а не рассуждением.
+template <int BT, int DK, int DV, int WM, int WN, int HPB, int MINB, bool TRI, typename IdxT,
+          int DBUF = 0>
 __global__ __launch_bounds__(WM * WN * 32, MINB) void volta_gdn_chunk_wu(
     const __half* __restrict__ kk,     // [B, T, Hg, DK]
     const __half* __restrict__ vv,     // [B, T, H,  DV]
@@ -128,7 +136,9 @@ __global__ __launch_bounds__(WM * WN * 32, MINB) void volta_gdn_chunk_wu(
 
   extern __shared__ __half smem[];
   __half* sA = smem;                  // [BT][LDA]  левый операнд, масштабированный по столбцам
-  __half* sV = sA + BT * LDA;         // [BT][LDB]  V текущей головы значения
+  // При DBUF=1 фаза w пишет ВТОРУЮ копию A: барьер между store u и её укладкой не нужен.
+  __half* sAw = smem + DBUF * (BT * LDA);
+  __half* sV = smem + (1 + DBUF) * (BT * LDA);   // [BT][LDB]  V текущей головы значения
   __half* sK = sV + BT * LDB;         // [BT][LDB]  K головы ключа -- ОДИН на всю группу голов
   // Два готовых столбцовых масштаба. __align__(16) обязателен: читаем их по 8 half одной LDS.128,
   // а массив __half по умолчанию выровнен на 2 байта.
@@ -182,17 +192,17 @@ __global__ __launch_bounds__(WM * WN * 32, MINB) void volta_gdn_chunk_wu(
 
   // Длина свёртки: строки варпа [ro, ro+SM), а A[i][j] = 0 при j > i -> хватает ro+SM.
   // Ветвление ПО ВАРПАМ, а не по полосам: расхождения внутри варпа нет, стоимость нулевая.
-#define FA2_WU_GEMM(SB, KK) mm.template accumulate<(KK)>(sA, LDA, ro, (SB), LDB, co, lane)
-  auto gemm = [&](const __half* sB) {
+#define FA2_WU_GEMM(SA, SB, KK) mm.template accumulate<(KK)>((SA), LDA, ro, (SB), LDB, co, lane)
+  auto gemm = [&](const __half* sL, const __half* sB) {
     if constexpr (!TRI || WM == 1) {
-      FA2_WU_GEMM(sB, BT);
+      FA2_WU_GEMM(sL, sB, BT);
     } else if constexpr (WM == 2) {
-      if (wm == 0) { FA2_WU_GEMM(sB, SM); } else { FA2_WU_GEMM(sB, 2 * SM); }
+      if (wm == 0) { FA2_WU_GEMM(sL, sB, SM); } else { FA2_WU_GEMM(sL, sB, 2 * SM); }
     } else {
-      if (wm == 0)      { FA2_WU_GEMM(sB, SM); }
-      else if (wm == 1) { FA2_WU_GEMM(sB, 2 * SM); }
-      else if (wm == 2) { FA2_WU_GEMM(sB, 3 * SM); }
-      else              { FA2_WU_GEMM(sB, 4 * SM); }
+      if (wm == 0)      { FA2_WU_GEMM(sL, sB, SM); }
+      else if (wm == 1) { FA2_WU_GEMM(sL, sB, 2 * SM); }
+      else if (wm == 2) { FA2_WU_GEMM(sL, sB, 3 * SM); }
+      else              { FA2_WU_GEMM(sL, sB, 4 * SM); }
     }
   };
 
@@ -275,12 +285,14 @@ __global__ __launch_bounds__(WM * WN * 32, MINB) void volta_gdn_chunk_wu(
     __syncthreads();
 
     mm.clear();
-    gemm(sV);
+    gemm(sA, sV);
     store_out(uu + (long)ih * DV, H * DV);
 
-    // --- ФАЗА w: sA = A * beta * e^g. Пересчитывается из ИСХОДНЫХ регистров, а не домножением уже
+    // --- ФАЗА w: A * beta * e^g. Пересчитывается из ИСХОДНЫХ регистров, а не домножением уже
     // округлённой sA -- иначе округлений стало бы три вместо двух. sV и sK не трогаем.
-    __syncthreads();
+    // При DBUF=1 запись идёт во ВТОРУЮ копию (sAw != sA): WAR-конфликта с чужими чтениями sA нет,
+    // барьер перед укладкой не нужен -- ptxas получает право тянуть эти STS в тень gemm(sV).
+    if constexpr (!DBUF) __syncthreads();
 #pragma unroll
     for (int s = 0; s < kAV; ++s) {
       const int q = tid + s * nthr, r = q / (BT / 8), c = (q % (BT / 8)) * 8;
@@ -290,13 +302,13 @@ __global__ __launch_bounds__(WM * WN * 32, MINB) void volta_gdn_chunk_wu(
       const __half2* sh = reinterpret_cast<const __half2*>(&sc);
 #pragma unroll
       for (int m = 0; m < 4; ++m) ah[m] = __hmul2(ah[m], sh[m]);
-      *reinterpret_cast<uint2*>(&sA[r * LDA + c]) = make_uint2(a.x, a.y);
-      *reinterpret_cast<uint2*>(&sA[r * LDA + c + 4]) = make_uint2(a.z, a.w);
+      *reinterpret_cast<uint2*>(&sAw[r * LDA + c]) = make_uint2(a.x, a.y);
+      *reinterpret_cast<uint2*>(&sAw[r * LDA + c + 4]) = make_uint2(a.z, a.w);
     }
     __syncthreads();
 
     mm.clear();
-    gemm(sK);
+    gemm(sAw, sK);
     store_out(ww + (long)ih * DK, H * DK);   // ЛОВУШКА: у w шаг строки H*DK, у входного k -- Hg*DK
   }
 #undef FA2_WU_GEMM
@@ -305,11 +317,11 @@ __global__ __launch_bounds__(WM * WN * 32, MINB) void volta_gdn_chunk_wu(
 // Разделяемая память ядра, В ОДНОМ МЕСТЕ с самим ядром. Хост обязан считать её ИМЕННО отсюда:
 // дополнения LDA/LDB выведены из арифметики банков (см. выше) и повторять их на стороне вызова --
 // это ровно тот класс расхождения, который даёт не отказ, а тихо неверный ответ.
-template <int BT, int DK, int DV>
+template <int BT, int DK, int DV, int DBUF = 0>
 __host__ __device__ constexpr size_t volta_gdn_wu_smem() {
   constexpr int LDA = BT + 4;
   constexpr int LDB = DK + 16;
-  return (size_t)(BT * LDA + 2 * BT * LDB) * sizeof(__half);
+  return (size_t)((1 + DBUF) * BT * LDA + 2 * BT * LDB) * sizeof(__half);
 }
 
 }  // namespace gdn

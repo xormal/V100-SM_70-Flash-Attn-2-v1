@@ -120,7 +120,19 @@ __global__ __launch_bounds__(WM * WN * 32, MINB ? MINB : 1) void volta_fwd_block
   // QCH -- ШАБЛОННЫЙ параметр, а не макрос: макрос один на всю единицу трансляции, а конфигураций
   // в ней две, и при выключенном макросе раскладка расходилась с выделенной памятью -> запись за
   // буфер и illegal memory access. Ровно этот дефект и был пойман.
-  constexpr int LDQ = QCH ? (DC + PAD) : (SWZ ? D : (D + PAD)), LDP = BK + PAD, LDK = DC + PAD;
+  constexpr int LDQ = QCH ? (DC + PAD) : (SWZ ? D : (D + PAD)), LDP = BK + PAD;
+  // [ШАГ СТРОКИ K КРАТЕН 16 БАЙТАМ, 27.08] Прежде LDK = DC + PAD = 68 полуслов, и в самом
+  // ядре стояло: «у K такой возможности нет» -- запись шла ДВУМЯ STS.64 вместо одной
+  // STS.128. Инструмент `kanal_ili_cep.py` показал, что тело связывает КАНАЛ MIO (ResMII
+  // 8928 против тензорных 8192, RecMII = 0 -- цепи нет вовсе), то есть лечится ТОЛЬКО
+  // снятием работы с разделяемой памяти, а половина её записей -- это лишняя половина K.
+  // Дополнение 8 даёт LDK = 72, шаг строки 144 байта -- кратен 16, и STS становится ОДНОЙ.
+  // Выключатель на случай худших банков: FA2SM70_LDK_PAD (умолчание 8, прежнее -- 4).
+#ifndef FA2SM70_LDK_PAD
+#define FA2SM70_LDK_PAD 8
+#endif
+  constexpr int PADK = FA2SM70_LDK_PAD;
+  constexpr int LDK = DC + PADK;
   // [ШАГ СТРОКИ V ПРОТИВ БАНКОВ] Дополнение 16, а не 4, и это не вкусовщина, а арифметика банков.
   // У n-мажорного операнда адрес полосы равен (lane&3)*(LDV/2) + nbase/2, где nbase из {0,4,8,12}.
   // Нужно, чтобы вклад СТРОКИ был крупнее вклада полосы: при (LDV/2)%32 == 8 получаем
@@ -328,8 +340,21 @@ __global__ __launch_bounds__(WM * WN * 32, MINB ? MINB : 1) void volta_fwd_block
       // считает ИНСТРУКЦИИ (§4n). У K такой возможности нет: LDK = 68 полуслов = 136 Б, не кратно.
       static_assert(!(ROUTE & 1) || ((D + PADV) * 2) % 16 == 0, "широкая запись V требует шаг, кратный 16 Б");
 #pragma unroll
-      for (int i = tid; i < BK * D / 8; i += kWarps * 32) {      // V целиком, векторно
-        const int r = i / (D / 8), c = (i % (D / 8)) * 8;
+      // [АДРЕСА В ПРОЛОГ, 27.08] Разложение `i -> (r, c)` считалось КАЖДУЮ итерацию: деление
+      // и остаток плюс 64-битный адрес. Аудит SASS показал 29.6 команд адресной арифметики
+      // на ОДНУ загрузку и 12.4 % слотов выдачи на адреса при HMMA 39.8 % -- ровно та подпись,
+      // которую уже лечили на плотном fp16-теле (задача 197). Когда шаг цикла кратен строке
+      // (kWarps*32 % (D/8) == 0 -- у нас 128 % 32), столбец НЕ МЕНЯЕТСЯ, а строка растёт на
+      // постоянную величину. Тогда разложение делается ОДИН раз, а в цикле остаётся сложение.
+      // Преобразование ТОЖДЕСТВЕННО: то же множество (r, c), тот же порядок.
+      constexpr int _шагV = (kWarps * 32) / (D / 8);
+      constexpr bool _ровноV = ((kWarps * 32) % (D / 8)) == 0;
+      const int _r0V = tid / (D / 8), _c0V = (tid % (D / 8)) * 8;
+      int _rV = _r0V;
+#pragma unroll
+      for (int i = tid; i < BK * D / 8; i += kWarps * 32, _rV += _шагV) {      // V целиком, векторно
+        const int r = _ровноV ? _rV : (i / (D / 8));
+        const int c = _ровноV ? _c0V : ((i % (D / 8)) * 8);
         if constexpr (ROUTE & 4) {   // предвыборка СЛЕДУЮЩЕЙ плитки: безопасна, ничего не вытесняет
           if (kb + BK + r < Sk) prefetch_l2(&Vv[(long)(kb + BK + r) * D + c]);   // за Sk не трогаем
         }
@@ -432,13 +457,23 @@ FA2B_UNROLL(FA2_FUNROLL)
 #pragma unroll
       for (int dc = 0; dc < D; dc += DC) {                        // K кусками по d
         __syncthreads();
+        // [АДРЕСА В ПРОЛОГ] то же лечение, что и у V выше.
+        constexpr int _шагK = (kWarps * 32) / (DC / 8);
+        constexpr bool _ровноK = ((kWarps * 32) % (DC / 8)) == 0;
+        const int _r0K = tid / (DC / 8), _c0K = (tid % (DC / 8)) * 8;
+        int _rK = _r0K;
 #pragma unroll
-        for (int i = tid; i < BK * DC / 8; i += kWarps * 32) {
-          const int r = i / (DC / 8), c = (i % (DC / 8)) * 8;
+        for (int i = tid; i < BK * DC / 8; i += kWarps * 32, _rK += _шагK) {
+          const int r = _ровноK ? _rK : (i / (DC / 8));
+          const int c = _ровноK ? _c0K : ((i % (DC / 8)) * 8);
           const uint4 gk = *reinterpret_cast<const uint4*>(&Kk[(long)(kb + FA2_KROW(r)) * D + dc + c]);
           __half* pk = &sK[r * LDK + c];
-          *reinterpret_cast<uint2*>(pk) = make_uint2(gk.x, gk.y);
-          *reinterpret_cast<uint2*>(pk + 4) = make_uint2(gk.z, gk.w);
+          if constexpr ((LDK * 2) % 16 == 0) {
+            sts128(pk, gk);                    // ОДНА инструкция: шаг строки кратен 16 Б
+          } else {
+            *reinterpret_cast<uint2*>(pk) = make_uint2(gk.x, gk.y);
+            *reinterpret_cast<uint2*>(pk + 4) = make_uint2(gk.z, gk.w);
+          }
         }
         __syncthreads();
         if constexpr (SWZ && DC == D)

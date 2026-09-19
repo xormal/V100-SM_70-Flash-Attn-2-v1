@@ -8,6 +8,7 @@
 // from examples/41 -- the same fmha_cutlassF_*_sm70 kernel torch SDPA dispatches to (~13.5%).
 // Wrapped under our attn_fwd API (BHSD in via strides; out is BSHD then permuted; GQA expanded).
 #include <cstdlib>
+#include <limits>
 #include <cmath>
 #include <algorithm>
 #include <torch/extension.h>
@@ -18,6 +19,8 @@
 #include "volta_fwd_block.cuh"
 #include "volta_fwd_i8.cuh"
 #include "volta_fwd_ws.cuh"
+#include "volta_fwd_so.cuh"   // развязка ролей S/O (записка 26 §3.1), рычаг FA2SM70_FWD_SO
+#include "sparse_select.cu"   // Этап 1 разреженного префилла (записка 20)
 #include <math_constants.h>
 #include "kernel_forward.h"
 
@@ -63,8 +66,13 @@ __global__ void fwd_combine_splits_kernel(
   const long lse_base = (long)bh * lse_dim + q;
   const long o_base = (long)row * D;
 
-  if (threadIdx.x < nsplits)
-    sw[threadIdx.x] = LSEpart[lse_base + (long)threadIdx.x * lse_split_stride];
+  // [ЦИКЛ, А НЕ ОДНА НИТЬ НА СРЕЗ] Было `if (threadIdx.x < nsplits)`: при числе срезов БОЛЬШЕ
+  // числа нитей блока (128 при D>=128) срезы с 128-го не загружались вовсе, и их веса брались из
+  // неинициализированной разделяемой памяти. Прежний вызывающий (cutlass-путь) держал nsplits<=16,
+  // поэтому дефект спал. Расщепление постраничного пути дало 192 -- и он проснулся: relL2 к
+  // нерасщеплённому 7.3e-01 при 192 срезах, при 128 и меньше -- 4.5e-04.
+  for (int s = threadIdx.x; s < nsplits; s += blockDim.x)
+    sw[s] = LSEpart[lse_base + (long)s * lse_split_stride];
   __syncthreads();
   if (threadIdx.x == 0) {                           // nsplits <= 16: последовательно и дёшево
     float m = -CUDART_INF_F;
@@ -122,7 +130,17 @@ static int fwd_num_splits(int B, int H, int Sq, int Sk, int d, int kQ, int kK, b
   // so in training it surfaced three steps downstream as wrong dQ/dK with dV intact (delta =
   // (dO*O).sum inherits the bad O; dV never touches delta).
   // The gate is set where the measurements are: every split-K win recorded in the README is d<=128.
-  if (d > 128) return 1;
+  //
+  // [07.08.2026] ЗАПРЕТ СНЯТ, ПОТОМУ ЧТО СНЯТА ЕГО ПРИЧИНА. Коллизия была не в самом расщеплении,
+  // а в двух строках: срезы делили ОДИН буфер накопителя (сдвиг на срез добавлялся только выходу),
+  // и накопитель был приравнен к BHSD-выходу при BSHD-раскладке итератора. Оба места исправлены
+  // (run_fmha_splitk даёт настоящий буфер [ns,B,Sq,H,D], ядро сдвигает его на срез).
+  //
+  // ЗАЧЕМ ЭТО НУЖНО ИМЕННО ЗДЕСЬ. У боевой сети d=256 и окна нет, то есть запрет выключал главный
+  // рычаг заполнения ровно на боевой геометрии. ЗАМЕРЕНО на попадании в префикс (H=12, Hkv=2,
+  // d=256, Sk=63000, Sq<=64): 7.77 мс на слой при 12 блоках = 0.15 ВОЛНЫ на 80 SM, тогда как
+  // крыша по чтению этих же ключей 148 мкс. Связывает не работа, а пустая машина.
+  if (const char* g = std::getenv("FA2SM70_FWD_SPLIT_D128")) { if (std::atoi(g) && d > 128) return 1; }
   // ЧИСЛО SM БЕРЁМ У ТЕКУЩЕГО УСТРОЙСТВА, А НЕ У НУЛЕВОГО. Здесь стояло жёсткое 0, и это спящий
   // дефект: он молчит, пока каждый ранг видит ровно свою карту (CUDA_VISIBLE_DEVICES на ранг --
   // тогда устройство 0 и есть рабочее), и даёт число SM с ЧУЖОЙ карты, как только процесс видит
@@ -154,9 +172,26 @@ static int fwd_num_splits(int B, int H, int Sq, int Sk, int d, int kQ, int kK, b
   const long nblocks = (long)nq * B * H;
   const double avgw = (double)total / (double)nblocks;
   if ((double)nblocks > 0.9 * (double)slots && avgw < 16.0) return 1;
+  // [d>128, 07.08.2026] МАШИНА УЖЕ НАБИТА ПО ЧИСЛУ БЛОКОВ -- дробить нечего, свод только вычтет.
+  // Правило выше отвечает на вопрос «есть ли ПЕРЕКОС», а при d>128 связывает другое: хватает ли
+  // блоков ВООБЩЕ. ЗАМЕРЕНО (H=12, Hkv=2, d=256, Sk=63000): Sq=1 -> 12 блоков, x6.02; Sq=64 ->
+  // 24 блока, x3.02; Sq=512 -> 192 блока на 80 слотов, и дробление даёт x0.97, то есть УБЫТОК.
+  // Условие сужено до d>128 намеренно: при d<=128 порядок дробления измерен и менять его нельзя
+  // (записанный выигрыш 1,1,8192,128 +37% имеет 256 блоков и этим условием был бы убит).
 
+  if (d > 128 && (double)nblocks >= (double)slots) return 1;
   int s = (int)std::ceil((double)maxw / ideal);
   if (s > 16) s = 16;                              // выше 16 растут пустые срезы и цена свода
+  // ПРЕДОХРАНИТЕЛЬ ПО ПАМЯТИ. Площадка срезов -- это Opart[ns,B,H,Sq,D] и (при d>kK) ещё
+  // Oaccum[ns,B,Sq,H,D], оба fp32. При Sq=8192, H=12, d=256 один срез стоит 100 МБ, а восемь
+  // срезов -- 1.6 ГБ рядом с весами. Приз от расщепления есть только там, где блоков мало,
+  // а мало их при МАЛОМ Sq -- значит резать число срезов по памяти ничего не отнимает.
+  const double per_split = (double)B * H * Sq * d * 4.0 * 2.0;   // Opart + Oaccum
+  const double budget = 512.0 * 1024.0 * 1024.0;
+  if (per_split > 0.0 && s * per_split > budget) {
+    s = (int)(budget / per_split);
+    if (s < 1) s = 1;
+  }
   return s < 2 ? 1 : s;
 }
 
@@ -182,7 +217,21 @@ static std::tuple<torch::Tensor, torch::Tensor> run_fmha_splitk(
     p.key_ptr = reinterpret_cast<cutlass::half_t*>(K.data_ptr<at::Half>());
     p.value_ptr = reinterpret_cast<cutlass::half_t*>(V.data_ptr<at::Half>());
     p.output_ptr = Opart.data_ptr<float>();
-    p.output_accum_ptr = nullptr;                     // output_t уже fp32 -- накопитель идёт прямо в O
+    // НАКОПИТЕЛЬ. Здесь стояло `nullptr` с доводом «output_t уже fp32 -- накопитель идёт прямо в O».
+    // Довод верен ТОЛЬКО при kKeepOutputInRF (d <= kKeysPerBlock), когда накопителя вообще нет.
+    // При d > kKeysPerBlock ядро копит выход через глобальную, и нулевой указатель включает в ядре
+    // ветку «копить прямо в выход» (kernel_forward.h:404). Она законна лишь при BSHD-выходе -- шаг
+    // строки накопителя жёстко `head_dim_value * num_heads`, а у нашего BHSD-выхода шаг головы
+    // Sq*D. Совпадения нет, и результат был ТИХО НЕВЕРНЫМ (relL2 1.2e+01..4.8e+01), из-за чего
+    // расщепление и запретили при d>128. Даём НАСТОЯЩИЙ буфер в раскладке накопителя, по срезу
+    // на каждый срез; сдвиг на срез добавлен в ядре там же, где сдвигается выход.
+    torch::Tensor Oaccum;
+    p.output_accum_ptr = nullptr;
+    if (!Attention::kKeepOutputInRF) {
+        Oaccum = torch::empty({nsplits, B, Sq, H, d}, fopt);            // BSHD, как ждёт итератор
+        p.output_accum_ptr =
+            reinterpret_cast<typename Attention::output_accum_t*>(Oaccum.data_ptr<float>());
+    }
     p.logsumexp_ptr = Lpart.data_ptr<float>(); p.attn_bias_ptr = nullptr;
     p.scale = (float)scale;
     p.num_heads = H; p.num_batches = B; p.head_dim = d; p.head_dim_value = d;
@@ -602,7 +651,16 @@ std::tuple<torch::Tensor, torch::Tensor> attn_fwd_volta(torch::Tensor Q, torch::
     // резать надо BK, а не DC: при BK=32 разделяемая падает до 34 КБ И DC=64 сохраняется.
     // Сетка при этом обязана быть 4x2: SM = BQ/WM = 16 и SN = BK/WN = 16, оба кратны 16.
     constexpr int BQa = 64, BKa = 32, DCa = 64, MINBa = 2;
+    // [БЛОК Q 128, 27.08] K и V проходят через разделяемую память РАЗ НА КАЖДЫЙ БЛОК Q,
+    // поэтому вдвое больший блок Q вдвое режет трафик MIO -- а именно MIO связывает тело
+    // (`kanal_ili_cep.py`: ResMII 8928 против тензорных 8192, RecMII = 0). Расчёт: трафик
+    // 0.46 -> 0.23 ТБ, ResMII MIO ~4464 < 8192, тело становится ТЕНЗОРНЫМ, то есть упирается
+    // в крышу. Разделяемой нужно 77 КиБ из 96 -- влезает. Цена -- регистры на накопитель O
+    // (он растёт вдвое), поэтому переключатель: FA2SM70_FWD_BQ=64 возвращает прежнее.
+    static const int _bq_env = [](){ const char* e = getenv("FA2SM70_FWD_BQ");
+                                     return e ? atoi(e) : 64; }();  // умолчание 64: BQ=128 не проверен замером
     constexpr int BQb = 64, BKb = 64, DCb = 64, MINBb = 1;   // прежняя, для сверки
+    constexpr int BQc = 128;                                  // проверяемая
     const int BQ = occ2 ? BQa : BQb;
     const size_t sh = occ2
         ? (size_t)(BQa * (DCa + PAD) + BQa * (BKa + PAD) + BKa * (DCa + PAD) + BKa * (D + 8)) * sizeof(__half)
@@ -636,10 +694,13 @@ std::tuple<torch::Tensor, torch::Tensor> attn_fwd_volta(torch::Tensor Q, torch::
 // ПРИ BQ=32 ЗАКОННА ТОЛЬКО СЕТКА 2x4: WM=4 даёт SM = 32/4 = 8, не кратно 16, и шаблон
     // разворачивается в массивы НУЛЕВОГО размера. Инстанцировать её нельзя даже в мёртвой ветке --
     // компилятор всё равно разворачивает шаблон. Поэтому для occ2 сетка зафиксирована.
-#define FA2_PICK(WMx, WNx, Rx)                                                                      \
-    do { kern = causal ? fa2_sm70::block_fwd::volta_fwd_block<BQb, BKb, D, WMx, WNx, true,  DCb, false, PIPE, false, MINBb, 0, REV, 0, 0, 0, Rx> \
-                       : fa2_sm70::block_fwd::volta_fwd_block<BQb, BKb, D, WMx, WNx, false, DCb, false, PIPE, false, MINBb, 0, REV, 0, 0, 0, Rx>; \
+#define FA2_PICK_BQ(BQx, WMx, WNx, Rx)                                                              \
+    do { kern = causal ? fa2_sm70::block_fwd::volta_fwd_block<BQx, BKb, D, WMx, WNx, true,  DCb, false, PIPE, false, MINBb, 0, REV, 0, 0, 0, Rx> \
+                       : fa2_sm70::block_fwd::volta_fwd_block<BQx, BKb, D, WMx, WNx, false, DCb, false, PIPE, false, MINBb, 0, REV, 0, 0, 0, Rx>; \
          nthreads = WMx * WNx * 32; } while (0)
+#define FA2_PICK(WMx, WNx, Rx)                                                                      \
+    do { if (_bq_env == 128) FA2_PICK_BQ(BQc, WMx, WNx, Rx);                                        \
+         else                FA2_PICK_BQ(BQb, WMx, WNx, Rx); } while (0)
 #define FA2_PICK_OCC(Rx)                                                                            \
     do { kern = causal ? fa2_sm70::block_fwd::volta_fwd_block<BQa, BKa, D, 4, 2, true,  DCa, false, PIPE, false, MINBa, 0, REV, 0, 0, 0, Rx, 1> \
                        : fa2_sm70::block_fwd::volta_fwd_block<BQa, BKa, D, 4, 2, false, DCa, false, PIPE, false, MINBa, 0, REV, 0, 0, 0, Rx, 1>; \
@@ -656,6 +717,7 @@ std::tuple<torch::Tensor, torch::Tensor> attn_fwd_volta(torch::Tensor Q, torch::
     else if (wsel == 16) FA2_ROUTES(4, 4);
     else                 FA2_ROUTES(2, 4);
 #undef FA2_PICK
+#undef FA2_PICK_BQ
 #undef FA2_PICK_OCC
 #undef FA2_ROUTES
     C10_CUDA_CHECK(cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sh));
@@ -690,6 +752,402 @@ std::tuple<torch::Tensor, torch::Tensor> attn_fwd_volta(torch::Tensor Q, torch::
 //       +100 -- ТОТ ЖЕ формат, но перекладка у везущих ПО 16 Б на выдачу (§3b, кандидат A8).
 //               Законность (кратность 16 у шага строки и указателей) проверяется ниже; при
 //               нарушении -- молчаливый откат на узкую перекладку.
+
+// [ЗАДАЧА 163 -- СЛИЯНИЕ ПУТИ ПРЕФИЛЛА] Ядро ролей читает K/V ПРЯМО из страниц vLLM-пула
+// (int8 + масштаб на позицию), минуя сборку плит: KV пересекает HBM ОДИН раз вместо трёх
+// (пул -> запись плиты gather'ом -> чтение плиты ядром), промежуточные плиты не живут вовсе --
+// «привезти много, увезти мало». Первая версия закреплена на боевой поверхности: d=256,
+// формат 0 (int8 + масштаб на позицию), без окна, страница пула РОВНО 16 токенов.
+std::tuple<torch::Tensor, torch::Tensor> attn_fwd_volta_i8_paged(
+        torch::Tensor Q, torch::Tensor Kc, torch::Tensor Vc, torch::Tensor Kst, torch::Tensor Vst,
+        torch::Tensor BlockTable, int64_t T, double scale, bool causal,
+        // [РАЗРЕЖЕННЫЙ ОБХОД -- необязательный. Без индекса путь БАЙТ В БАЙТ прежний.]
+        c10::optional<torch::Tensor> selCnt = c10::nullopt,
+        c10::optional<torch::Tensor> selIdx = c10::nullopt,
+        int64_t selTI = 128, int64_t selB = 128,
+        // [ЗАПИСЬ ПРЯМО В БУФЕР ВЫЗЫВАЮЩЕГО -- 01.09]
+        // Общий путь ВЫДЕЛЯЛ выход, а хозяин копировал его наружу (`output.copy_(o[0])`),
+        // тогда как скалярный путь давно пишет напрямую (`..._paged_into`). На декодных формах
+        // это выделение и копия НА КАЖДЫЙ слой каждого шага. Микробенч (записка 25 §85) дал:
+        // само HMMA-тело быстрее скалярного на 6-11 % на ВСЕХ длинах, а сквозняком общий путь
+        // на коротком проигрывает 5 % -- разницу съедает такая обвязка.
+        c10::optional<torch::Tensor> Out = c10::nullopt) {
+    const c10::cuda::CUDAGuard device_guard(Q.device());
+    // [BQ=64 ПРИ BK=32 -- ДВЕРЬ, ЗАКРЫТАЯ НЕ ЦЕЛИКОМ. Проверено арифметикой 24.08]
+    // В коде стояло «BQ=64 требует 111 680 Б против потолка 98 304 -- закрыто РЕСУРСОМ». Это
+    // верно ДЛЯ BK=64. Пересчёт по той же формуле:
+    //     BQ=32 BK=64 ->  90 688 Б (боевое),  BQ=64 BK=64 -> 111 680 (не влезает),
+    //     BQ=64 BK=32 ->  72 768 Б -- ВЛЕЗАЕТ С ЗАПАСОМ.
+    // То есть дверь закрывали целиком, хотя закрыт был один её вариант. Зачем она: связывает
+    // ОЖИДАНИЕ НАКОПИТЕЛЯ S (зависимость софтмакса от первого умножения) -- вдвое больше строк
+    // на блок даёт вдвое больше независимой работы между зависимостями.
+    // Умолчание НЕ меняется (32/64); 64/32 включается переменной и меряется.
+    constexpr int D = 256, REV = 1, PAD = 4, DC = 64;
+    const char* pbq_e = getenv("FA2SM70_PAGED_BQ");
+    const int pbq = (pbq_e && *pbq_e) ? atoi(pbq_e) : 32;
+    TORCH_CHECK(pbq == 32 || pbq == 64, "FA2SM70_PAGED_BQ: допустимо 32 или 64, дано ", pbq);
+    constexpr int BQ = 32, BK = 64;            // боевая пара (умолчание)
+    constexpr int BQ2 = 64, BK2 = 32;          // проверяемая пара
+    const int B = Q.size(0), Sq = Q.size(1), H = Q.size(2), d = Q.size(3);
+    TORCH_CHECK(B == 1, "paged prefill: одна последовательность");
+    TORCH_CHECK(d == D && Kc.size(3) == D, "paged prefill: head_dim 256");
+    TORCH_CHECK(Q.scalar_type() == torch::kFloat16 && Kc.scalar_type() == torch::kChar,
+                "paged prefill: fp16 Q, int8 pool");
+    const int bs = Kc.size(1);
+    TORCH_CHECK(bs % 16 == 0, "paged prefill: страница кратна 16 токенам, получено ", bs);
+    const int Hkv = Kc.size(2);
+    const int Sk = (int)T;
+    TORCH_CHECK(H % Hkv == 0 && Sk >= Sq, "paged prefill: GQA и Sk >= Sq");
+    TORCH_CHECK(Kst.scalar_type() == torch::kFloat32 && Vst.scalar_type() == torch::kFloat32
+                && BlockTable.scalar_type() == torch::kInt32 && BlockTable.is_contiguous(),
+                "paged prefill: масштабы fp32, таблица int32 плотная");
+    TORCH_CHECK((long)BlockTable.numel() * bs >= Sk, "paged prefill: таблица короче префикса");
+    // Пул НЕ обязан быть плотным по страницам: у нативного бэкенда K и V чередуются в одной
+    // странице (страйд страницы 2*bs*Hkv*D). Требуются лишь плотные строки токена и общий шаг.
+    TORCH_CHECK(Kc.stride(3) == 1 && Kc.stride(2) == D && Kc.stride(1) == (long)Hkv * D,
+                "paged prefill: строки страницы K не плотные");
+    TORCH_CHECK(Vc.stride(3) == 1 && Vc.stride(2) == D && Vc.stride(1) == (long)Hkv * D
+                && Vc.stride(0) == Kc.stride(0),
+                "paged prefill: раскладка V не совпадает с K");
+    torch::Tensor O;
+    if (Out.has_value()) {
+        O = Out.value();
+        TORCH_CHECK(O.scalar_type() == torch::kFloat16 && O.is_contiguous(),
+                    "paged prefill: Out обязан быть плотным fp16");
+        TORCH_CHECK(O.numel() == (long)B * Sq * H * D,
+                    "paged prefill: Out не той длины: ", O.numel(), " против ",
+                    (long)B * Sq * H * D);
+        O = O.view({B, Sq, H, D});
+    } else {
+        O = torch::empty({B, Sq, H, D}, torch::dtype(torch::kFloat16).device(Q.device()));
+    }
+    const int lse_dim = ((Sq + 31) / 32) * 32;
+    auto lse = torch::empty({B, H, lse_dim}, torch::dtype(torch::kFloat32).device(Q.device()));
+    size_t sh = (size_t)((size_t)BQ * (D + PAD) + (size_t)BQ * (BK + PAD)) * sizeof(__half)
+              + (size_t)2 * BK * ((D + 16) + (D + 16));
+    if (getenv("FA2SM70_I8_NOBANKSHIFT") == nullptr) sh += 64;
+    TORCH_CHECK(sh <= 96 * 1024, "paged prefill: разделяемая не влезает: ", sh);
+    // Хвост шаблона: KVFMT=0, WIDE=0, SWZ=0, DIAG=0, PHSPLIT=0, KSP=1, KSPL=0, PAGED=1.
+    //
+    // [WN=2 -- ПРЯМОЙ РЫЧАГ ПО СВЯЗЫВАЮЩЕМУ КАНАЛУ, FA2SM70_PAGED_WN=2]
+    // Укладчик по машинному коду даёт ResMII 2786 при RecMII 0: связывает КАНАЛ (MIO 99.1 % при
+    // тензорной трубе 73.5 %), а не цепь. Операнд Q читается из разделяемой ВНУТРИ цикла по k,
+    // и это ОДИН И ТОТ ЖЕ Q на всех плитках ключей. Ширина полосы варпа по ключам SN = BK/WN:
+    // при WN=2 она вдвое шире, значит трафик Q НА КЛЮЧ падает вдвое -- ход именно по тому
+    // ресурсу, который связывает.
+    // Дверь была закрыта ДЕФЕКТОМ ХОСТА (счёт нитей зашит восьмёркой, ядро с WN=2 объявляет
+    // (2+2)*32*2 и запуск отвергался как cudaErrorInvalidValue), дефект снят -- но ЗАМЕРОМ она
+    // так и не проверялась. Умолчание НЕ меняется: 4, как было; 2 включается переменной.
+    // [УЗКАЯ ПЛИТКА ЗАПРОСОВ ДЛЯ ДЕКОДА, FA2SM70_PAGED_BQ16]
+    // ЗАМЕР, КОТОРЫЙ ЭТО ПОРОДИЛ: при Sk=226304 ядро идёт 2035 мкс при Sq=4 и 2480 мкс при Sq=32.
+    // То есть работа почти НЕ ЗАВИСИТ от числа запросов: плитка BQ=32 гоняется целиком ради
+    // четырёх строк, и семь восьмых тензорной работы и трафика разделяемой -- впустую.
+    // Профиль подтверждает, ЧТО именно тратится: L1TEX 68.3 %, DRAM 11.8 % -- связывает
+    // разделяемая, а её трафик пропорционален BQ.
+    // BQ=16 -- минимум, допустимый геометрией: SM = BQ/WM обязано быть кратно 16, значит WM=1;
+    // SN = BK/WN тоже кратно 16, значит WN<=4. Берём WM=1, WN=4 -> 4 считающих варпа.
+    // Умолчание ВЫКЛЮЧЕНО: включается рычагом и решается замером.
+    const char* pbq16_e = getenv("FA2SM70_PAGED_BQ16");
+    const int pbq16 = (pbq16_e && *pbq16_e) ? atoi(pbq16_e) : 0;
+    // Разреженный обход узкой плитке НЕ мешает: ядро адресует индекс как q0/(BQ*selGroup), а
+    // хост подбирает selGroup = selTI/BQ -- при BQ=16 группа вдвое больше, произведение то же.
+    // Условие кратности selTI % BQ при BQ=16 слабее, чем при 32, значит тоже выполнено.
+    const bool узкая = (pbq16 == 1) && (Sq <= 16);
+    const int bqEff = узкая ? 16 : BQ;
+    const char* pwn_e = getenv("FA2SM70_PAGED_WN");
+    const int pwn = (pwn_e && *pwn_e) ? atoi(pwn_e) : 4;
+    TORCH_CHECK(pwn == 2 || pwn == 4, "FA2SM70_PAGED_WN: допустимо 2 или 4, дано ", pwn);
+    // [KSP / KSPL -- ДВА ХОДА ПО ДИНАМИЧЕСКОМУ ПРОФИЛЮ 27.08]
+    // Профиль простоев настоящего ядра префилла (не статика, которая говорила «ISSUE 100 %»):
+    //     mio_throttle 0.86 | not_selected 0.73 | barrier 0.53 | wait 0.52 | math_pipe 0.36
+    // Связывает РАЗДЕЛЯЕМАЯ (L1/TEX 71.3 %), занятость 18.75 % (один блок на SM).
+    //   KSP=2  -- расщепление цепочки накопителя ПЕРВОГО умножения по k: независимых цепочек
+    //             становится восемь вместо четырёх. Бьёт по `wait` (0.52). Код уже написан в
+    //             примитиве и здесь просто не был включён. Ответ НЕ побитово тот же (порядок
+    //             суммирования fp32), точность не хуже -- это шаг попарного суммирования.
+    //   KSPL=1 -- у каждого варпа СВОЯ полоса ключей в ОБОИХ умножениях и свой (m, l), сведение
+    //             ОДИН раз в эпилоге. Из мейнлупа уходят ОБА межварповых свода. Бьёт по
+    //             `barrier` (0.53). KSPL=2 -- то же без части свода (см. шаблон).
+    // Умолчания НЕ меняются (KSP=1, KSPL=0); включаются переменными и решаются ЗАМЕРОМ.
+    const char* pksp_e  = getenv("FA2SM70_PAGED_KSP");
+    const char* pkspl_e = getenv("FA2SM70_PAGED_KSPL");
+    const int pksp  = (pksp_e  && *pksp_e ) ? atoi(pksp_e ) : 1;
+    const int pkspl = (pkspl_e && *pkspl_e) ? atoi(pkspl_e) : 0;
+    TORCH_CHECK(pksp == 1 || pksp == 2, "FA2SM70_PAGED_KSP: допустимо 1 или 2, дано ", pksp);
+    TORCH_CHECK(pkspl >= 0 && pkspl <= 2, "FA2SM70_PAGED_KSPL: допустимо 0, 1 или 2, дано ", pkspl);
+// [SWZ В ПОСТРАНИЧНОМ ПУТИ -- ЗАКРЫТО ЗАМЕРОМ 30.08, НЕ ОТКРЫВАТЬ]
+// Повод был верный: профиль префилльной формы (Sq=4096, Sk=131072) даёт L1TEX 70.5 % при
+// тензорной трубе 38.2 % и DRAM 20.6 %, то есть связывает разделяемая, а SWZ бьёт ровно по
+// ней (переставляет куски 16 Б против двухпутевого банкового конфликта на LDS.128, числа
+// выдач не меняя). Шаблонное ограничение PAGED на SWZ не распространяется, инстанцируется.
+// НО ОТВЕТ МЕНЯЕТСЯ: relL2 к SWZ=0 составил 2.5e-02 (Sk=32768), 1.2e-02 (131072),
+// 9.0e-03 (249856) -- перестановка НЕ согласована с постраничным чтением, это тихая порча.
+// Выигрыш при этом мизерный: x1.08 / x1.02 / x1.02. Инстанс убран намеренно: рычаг, который
+// молча портит ответ ради двух процентов, опаснее отсутствия рычага.
+#define FA2_PAGED_K(KS, KL)                                                                     \
+    (causal ? fa2_sm70::fwd_ws::volta_fwd_ws<BQ, BK, D, 2, 4, true,  DC, 1, REV, D, 0, 0, 0, 0, 0, KS, KL, 1> \
+            : fa2_sm70::fwd_ws::volta_fwd_ws<BQ, BK, D, 2, 4, false, DC, 1, REV, D, 0, 0, 0, 0, 0, KS, KL, 1>)
+
+    // ПЕРВЫЙ КРУГ -- ТОЛЬКО KSP. Каждое инстанцирование этого ядра стоит минут сборки и мегабайт
+    // .so; шесть комбинаций сразу -- расточительство, а если KSPL не соберётся с PAGED=1, упадёт
+    // и проверка KSP. KSPL включается вторым кругом, когда KSP измерен.
+    // KSP=2 ЗАКРЫТ ЗАМЕРОМ (27.08): ABBA-перебор, 10 кругов после прогрева до установившегося
+    // такта -- x0.9898, быстрее лишь в 6 кругах из 10. Значит `wait` (0.52) НЕ на критическом
+    // пути: при not_selected 0.73 планировщику есть кого запускать, связывает ПРОПУСКНАЯ
+    // способность разделяемой, а не задержка. Инстанцирование оставлено для повторяемости.
+    auto kern = FA2_PAGED_K(1, 0);
+    if (pksp == 2 && pkspl == 0) kern = FA2_PAGED_K(2, 0);
+    else if (pksp == 1 && pkspl == 1) kern = FA2_PAGED_K(1, 1);
+    else TORCH_CHECK(pksp == 1 && pkspl == 0, "сочетание KSP/KSPL не инстанцировано");
+#undef FA2_PAGED_K
+    if (pbq == 64) {
+        kern = causal
+            // WN=2 ОБЯЗАТЕЛЕН ПРИ BK=32: полоса варпа по ключам SN = BK/WN должна быть кратна 16
+            // (плитка HMMA). При WN=4 вышло бы 8 -- static_assert ловит это на сборке.
+            ? fa2_sm70::fwd_ws::volta_fwd_ws<BQ2, BK2, D, 2, 2, true,  DC, 1, REV, D, 0, 0, 0, 0, 0, 1, 0, 1>
+            : fa2_sm70::fwd_ws::volta_fwd_ws<BQ2, BK2, D, 2, 2, false, DC, 1, REV, D, 0, 0, 0, 0, 0, 1, 0, 1>;
+        sh = (size_t)((size_t)BQ2 * (D + PAD) + (size_t)BQ2 * (BK2 + PAD)) * sizeof(__half)
+           + (size_t)2 * BK2 * ((D + 16) + (D + 16));
+        if (getenv("FA2SM70_I8_NOBANKSHIFT") == nullptr) sh += 64;
+        TORCH_CHECK(sh <= 96 * 1024, "paged prefill BQ=64/BK=32: разделяемая не влезает: ", sh);
+    }
+    if (pwn == 2) {
+        kern = causal
+            ? fa2_sm70::fwd_ws::volta_fwd_ws<32, BK, D, 2, 2, true,  DC, 1, REV, D, 0, 0, 0, 0, 0, 1, 0, 1>
+            : fa2_sm70::fwd_ws::volta_fwd_ws<32, BK, D, 2, 2, false, DC, 1, REV, D, 0, 0, 0, 0, 0, 1, 0, 1>;
+    }
+    // [ПЛИТКА КЛЮЧЕЙ 32 -- ПРИБОР, А НЕ РЫЧАГ, FA2SM70_PAGED_BK32]
+    // Вопрос, на который он отвечал: связывает ОБЪЁМ разделяемой (тогда вдвое меньший буфер
+    // K/V поможет, и переработка мейнлупа ради ДВУХ блоков на SM оправдана) или РАБОТА НА
+    // ПЛИТКУ (тогда меньшая плитка только добавит накладных). Профиль давал L1TEX 70.5 % при
+    // занятости 18.7 % -- один блок на SM из-за 90.7 КиБ разделяемой, из которых 68 КиБ это
+    // двойной буфер K/V при BK=64.
+    //
+    // ОТВЕТ ЗАМЕРОМ (30.08): BK=32 ХУЖЕ ВЕЗДЕ -- префилл (Sq=4096) x0.73/0.73/0.74 на
+    // Sk=32768/131072/249856; декод (Sq=4) x0.66/0.64/0.65 на 65536/131072/249856.
+    // Значит связывает НЕ объём буфера, а работа на плитку: вдвое меньшая плитка ключей даёт
+    // вдвое больше плиток, и пролог (Q-фрагменты, синхронизации, свод) не окупается.
+    // СЛЕДСТВИЕ: переработка мейнлупа ради двух резидентных блоков БЕСПОЛЕЗНА -- шаг в ту
+    // сторону уже проигрывает 26-35 %, и занятость этого не отыграет. Дверь закрыта ДО того,
+    // как на неё потрачен день. Прибор оставлен под рычагом для повторяемости.
+    // Геометрия: SM = BQ/WM = 16 и SN = BK/WN = 16 требуют WM=2, WN=2 при BQ=32, BK=32.
+    {
+        const char* e = getenv("FA2SM70_PAGED_BK32");
+        if (e && atoi(e) == 1 && pksp == 1 && pkspl == 0 && pbq != 64 && !узкая) {
+            kern = causal
+                ? fa2_sm70::fwd_ws::volta_fwd_ws<32, 32, D, 2, 2, true,  DC, 1, REV, D, 0, 0, 0, 0, 0, 1, 0, 1>
+                : fa2_sm70::fwd_ws::volta_fwd_ws<32, 32, D, 2, 2, false, DC, 1, REV, D, 0, 0, 0, 0, 0, 1, 0, 1>;
+            sh = (size_t)((size_t)32 * (D + PAD) + (size_t)32 * (32 + PAD)) * sizeof(__half)
+               + (size_t)2 * 32 * ((D + 16) + (D + 16));
+            if (getenv("FA2SM70_I8_NOBANKSHIFT") == nullptr) sh += 64;
+            TORCH_CHECK(sh <= 96 * 1024, "paged BK=32: разделяемая не влезает: ", sh);
+        }
+    }
+    // [PHSPLIT -- РАЗВЕДЕНИЕ ФАЗ, FA2SM70_PAGED_PHSPLIT]
+    // Повод: фальсификаторы дали «софтмакс 15 % времени, и всё это время тензорная труба
+    // ПРОСТАИВАЕТ», потому что два внутренних рандеву держат всех считающих в одной фазе.
+    // PHSPLIT делает рандеву ПОГРУППНЫМ (именованные барьеры 4+wm), и группы wm=0/wm=1
+    // получают право разъехаться по фазе: на каждом планировщике один варп считает софтмакс,
+    // другой выдаёт HMMA. Число выдач НЕ меняется -- это укладка, а не сокращение работы.
+    // Требует WM=2 (при WM=1 погруппный барьер вырождается в общий).
+    {
+        const char* e = getenv("FA2SM70_PAGED_PHSPLIT");
+        if (e && atoi(e) == 1 && pksp == 1 && pkspl == 0 && pwn == 4 && pbq != 64 && !узкая) {
+            kern = causal
+                ? fa2_sm70::fwd_ws::volta_fwd_ws<BQ, BK, D, 2, 4, true,  DC, 1, REV, D, 0, 0, 0, 0, 1, 1, 0, 1>
+                : fa2_sm70::fwd_ws::volta_fwd_ws<BQ, BK, D, 2, 4, false, DC, 1, REV, D, 0, 0, 0, 0, 1, 1, 0, 1>;
+        }
+    }
+    if (узкая) {
+        // МАРШРУТ ДОКАЗЫВАЕТСЯ ПЕЧАТЬЮ ПО ФАКТУ РАБОТЫ, а не наличием переменной окружения:
+        // сквозной замер разошёлся с микрозамером, и первый вопрос -- берётся ли ветвь вообще.
+        static bool _сказано = false;
+        if (!_сказано) { _сказано = true;
+            fprintf(stderr, "[fa2_sm70] postранично: УЗКАЯ плитка запросов BQ=16 (Sq=%d, ksplit будет по bqEff=16)\n", (int)Sq); }
+        kern = causal
+            ? fa2_sm70::fwd_ws::volta_fwd_ws<16, BK, D, 1, 4, true,  DC, 1, REV, D, 0, 0, 0, 0, 0, 1, 0, 1>
+            : fa2_sm70::fwd_ws::volta_fwd_ws<16, BK, D, 1, 4, false, DC, 1, REV, D, 0, 0, 0, 0, 0, 1, 0, 1>;
+        sh = (size_t)((size_t)16 * (D + PAD) + (size_t)16 * (BK + PAD)) * sizeof(__half)
+           + (size_t)2 * BK * ((D + 16) + (D + 16));
+        if (getenv("FA2SM70_I8_NOBANKSHIFT") == nullptr) sh += 64;
+        TORCH_CHECK(sh <= 96 * 1024, "paged prefill BQ=16: разделяемая не влезает: ", sh);
+    }
+    C10_CUDA_CHECK(cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sh));
+    const float sc = (float)scale * 1.4426950408889634f;
+    // ЧИСЛО НИТЕЙ СЛЕДУЕТ ЗА ГЕОМЕТРИЕЙ ЯДРА, А НЕ НАОБОРОТ -- именно зашитая здесь восьмёрка и
+    // закрывала WN=2 ложным «отвергается запуском».
+    // Узкая плитка идёт с WM=1, WN=4 -- тоже 4 считающих варпа.
+    const char* _bk32_e = getenv("FA2SM70_PAGED_BK32");
+    const bool _bk32 = (_bk32_e && atoi(_bk32_e) == 1 && pksp == 1 && pkspl == 0 && pbq != 64 && !узкая);
+    const int wsCons = (pwn == 2 || pbq == 64 || узкая || _bk32) ? 4 : 8;   // BQ=64 идёт с WN=2, значит 4 считающих
+    // [РАЗВЯЗКА РОЛЕЙ S/O, 13.09] FA2SM70_FWD_SO=1: ядро volta_fwd_so вместо volta_fwd_ws на боевой форме
+    // (BQ=32, BK=64, WN=4, KSP=1, KSPL=0, без BK32/BQ16/BQ64). Замер на приборе: −9…−11 % к ws на 8192/16384.
+    const char* _so_e = getenv("FA2SM70_FWD_SO");
+    // FA2SM70_FWD_SO=1 -- всегда; =2 -- ТОЛЬКО плотные вызовы (без индекса отбора): в бою S/O проигрывало на разреженных
+    // страницах (+17 %), а на плотном приборе выигрывало (−10 %); плотные поздние слои (LAYER_MAX=39) -- 57 % времени внимания.
+    const int _so_mode = _so_e ? atoi(_so_e) : 0;
+    const bool _so_dense_only = (_so_mode == 2) && !(selIdx.has_value() && selCnt.has_value());
+    const bool _use_so = ((_so_mode == 1) || _so_dense_only) && pbq != 64 && !узкая && pwn == 4 && pksp == 1 && pkspl == 0 && !_bk32;
+    {
+        static bool _so_skazano = false;
+        if (_use_so && !_so_skazano) { _so_skazano = true; fprintf(stderr, "[fa2_sm70] постранично: ядро РАЗВЯЗКИ РОЛЕЙ S/O (FA2SM70_FWD_SO=1)\n"); }
+    }
+    const int nthr = ((FA2_WSPROD > 0 ? FA2_WSPROD : wsCons) + wsCons) * 32;
+    // ВИРТУАЛЬНЫЕ 16-страницы: страница пула любого размера (у нативного 1568 токенов, K и V
+    // чередуются) режется на куски по 16; ядру отдаются ГОТОВЫЕ байтовые смещения данных и
+    // базы индексов масштабов. Три тензорных опа на вызов -- копейки против ядра.
+    // [ИНДЕКС] Плитка счёта selTI крупнее блока запросов ядра BQ, а блок индекса (selTI-независимый)
+    // крупнее плитки ключей BK. Оба отношения ЦЕЛЫЕ и проверяются здесь, а не в ядре: в ядре это
+    // стоило бы деления на каждой итерации, а тут -- один раз на вызов.
+    const int* _sI = nullptr; const int* _sC = nullptr;
+    int _sStride = 0, _sGroup = 1, _sSub = 1;
+    if (selIdx.has_value() && selCnt.has_value()) {
+        auto I = selIdx.value(), C = selCnt.value();
+        TORCH_CHECK(I.scalar_type() == torch::kInt32 && C.scalar_type() == torch::kInt32,
+                    "индекс отбора: int32");
+        TORCH_CHECK(I.dim() == 3 && C.dim() == 2 && I.is_contiguous() && C.is_contiguous(),
+                    "индекс отбора: cnt [плитки, Hkv], idx [плитки, Hkv, NB], плотные");
+        TORCH_CHECK(I.size(1) == Hkv && C.size(1) == Hkv, "индекс отбора: ось Hkv не совпала");
+        TORCH_CHECK(selTI % bqEff == 0, "плитка счёта кратна блоку запросов ядра: ", selTI, " % ", bqEff);
+        const long NBsel = I.size(2);
+        // [РАЗМЕР БЛОКА ИНДЕКСА ПЕРЕДАЁТСЯ, А НЕ ВЫВОДИТСЯ]  Прежде он выводился как
+        // (Sk + NB - 1)/NB -- и это ВЕРНО только когда Sk кратно блоку. При коротком контексте
+        // (Sk=100, NB=1) вывод давал 100, проверка кратности падала и роняла ВОРКЕР.
+        // Настоящий размер знает тот, кто строил индекс, -- он его и передаёт.
+        const long Bsel = selB;
+        TORCH_CHECK(Bsel % BK == 0, "блок индекса кратен плитке ключей: ", Bsel, " % ", BK);
+        TORCH_CHECK(NBsel * Bsel >= Sk, "индекс короче контекста: ", NBsel, "x", Bsel, " < ", Sk);
+        TORCH_CHECK(I.size(0) * selTI >= Sq, "индекс короче запросов: ", I.size(0), "x", selTI);
+        _sI = I.data_ptr<int>(); _sC = C.data_ptr<int>();
+        const long sub = Bsel / BK;
+        TORCH_CHECK((sub & (sub - 1)) == 0, "блок индекса / плитка ключей должно быть степенью двойки: ", sub);
+        int subLog = 0; while ((1L << subLog) < sub) ++subLog;   // ядро сдвигает, а не делит
+        _sStride = (int)NBsel; _sGroup = (int)(selTI / bqEff); _sSub = subLog;
+    }
+    // [КЭШ ТАБЛИЦ СТРАНИЦ ОТКАЧЁН -- ЗАМЕР И РИСК, 27.08]
+    // Строил их заново на каждом из 16 слоёв куска, хотя зависят они только от (таблица блоков,
+    // Sk, геометрия пула). Выглядело как дублирующаяся хозяйская работа -- ровно тот класс,
+    // что цель называет «убрать параллельную работу». Кэш на одну запись НЕ ДАЛ НИЧЕГО:
+    // 7.67 мс против 7.73 на полу вызова.
+    // А «пол вызова 7.7 мс» оказался НЕ накладными, а ОДНОЙ ВОЛНОЙ ЯДРА: при малом Sq блоков
+    // всего 12, но каждый всё равно обходит ВЕСЬ KV -- работа не уменьшается, и прибор
+    // (уменьшать Sq) мерил не то.
+    // Плюс риск: `BlockTable.data_ptr()` кэширующий аллокатор торча переиспользует, и под тем же
+    // адресом может лежать ДРУГАЯ таблица -- тихая порча вместо падения.
+    // Правка без замеренной пользы и с настоящим риском не живёт.
+    const long n16 = ((long)Sk + 15) / 16;
+    auto i16   = torch::arange(n16, torch::dtype(torch::kLong).device(Q.device()));
+    auto tok0  = i16 * 16;
+    // ЦЕЛОЕ деление ЯВНО: в C++ API `tensor / int` -- это true division (float), и такой
+    // индекс тензором не принимается. floor_divide + index_select -- без сюрпризов.
+    auto pgIdx = tok0.floor_divide((long)bs);
+    auto page  = BlockTable.index_select(0, pgIdx).to(torch::kLong);
+    auto intra = tok0 - pgIdx * (long)bs;
+    auto vOff  = page * (long)Kc.stride(0) + intra * ((long)Hkv * D);
+    auto vScl  = (page * (long)bs + intra) * (long)Hkv;
+    vOff = vOff.contiguous(); vScl = vScl.contiguous();
+    // [РАСЩЕПЛЕНИЕ ПО КЛЮЧАМ -- записка 24] Включается ТОЛЬКО когда плитка запросов одна
+    // (Sq <= BQ, то есть это ДЕКОД выше порога, а не настоящий префилл): там сетка
+    // ((Sq+BQ-1)/BQ, H, 1) = H блоков, и машина недогружена. Замер на здоровой карте:
+    // при Sk=65536 время почти не зависит от H (H=2 -> 4611 мкс, H=12 -> 3933), то есть
+    // 12 блоков дают 102 ГБ/с из 800. Умолчание ВЫКЛЮЧЕНО: включается и меряется рычагом.
+    // УМОЛЧАНИЕ -- АВТО (0). Лестница на здоровой карте, мкс (Sq=4):
+    //   Sk=  16384: k=1 1178 -> k=24 272 -> k=32 273 -> k=64 319 -> k=192 432
+    //   Sk=  65536: k=1 4477 -> k=24 731 -> k=32 700 -> k=64 743 -> k=192 839
+    //   Sk= 262144: k=1 15237 -> k=24 2457 -> k=32 2329 -> k=40 2326 -> k=64 2391
+    // Плато 24-40, дальше свод и пустые блоки съедают приз. Правило: срез не короче 16 плиток
+    // (1024 ключей -- ниже этого блок не окупает свой пролог), потолок 32.
+    // ТОЧНОСТЬ ОТ РАСЩЕПЛЕНИЯ НЕ ПАДАЕТ, А РАСТЁТ: к точному эталону (fp32-деквант + fp64-софтмакс)
+    // relL2 при Sk=65536 идёт 3.24e-03 у k=1 против 2.11e-03 у k=32 -- цепь онлайн-аккумуляции
+    // внутри среза короче, а свод идёт в fp32.
+    int _ksplit = 1;
+    {
+        const char* e = getenv("FA2SM70_PAGED_KSPLIT");
+        const int want = e ? atoi(e) : 0;                     // 0 = авто, 1 = выключено
+        const int nTilesApprox = (Sk + 64 - 1) / 64;          // BK у боевого пути = 64
+        int cand = want;
+        if (want == 0) {                                      // авто по замеру выше
+            cand = nTilesApprox / 16;
+            if (cand > 32) cand = 32;
+        }
+        if (cand > 1 && Sq <= bqEff)
+            _ksplit = cand < nTilesApprox ? cand : (nTilesApprox > 1 ? nTilesApprox : 1);
+    }
+    torch::Tensor Opart, Lpart, Otmp, Ltmp;
+    float *pOp = nullptr, *pLp = nullptr;
+    if (_ksplit > 1) {
+        auto fo = torch::dtype(torch::kFloat32).device(Q.device());
+        Opart = torch::empty({(long)_ksplit, (long)B, (long)H, (long)Sq, (long)D}, fo);
+        // ВТОРОЙ ЗАМОК на пустой срез: даже если срез почему-то не дойдёт до эпилога, его LSE
+        // обязан быть -inf, иначе сводящее ядро примет неинициализированную память за активный
+        // срез. Стоит 1536 float на вызов -- цена ничтожна против класса отказа.
+        Lpart = torch::full({(long)_ksplit, (long)B, (long)H, (long)Sq},
+                            -std::numeric_limits<float>::infinity(), fo);
+        pOp = Opart.data_ptr<float>(); pLp = Lpart.data_ptr<float>();
+        // Сводящее ядро пишет BHSD, а наш выход BSHD -- сводим во ВРЕМЕННЫЙ и переставляем.
+        Otmp = torch::empty({(long)B, (long)H, (long)Sq, (long)D},
+                            torch::dtype(torch::kFloat16).device(Q.device()));
+        Ltmp = torch::empty({(long)B, (long)H, (long)Sq}, fo);
+    }
+    if (_use_so) {
+        auto kso = causal ? fa2_sm70::fwd_so::volta_fwd_so<32, BK, D, true,  REV, 0, 1>
+                          : fa2_sm70::fwd_so::volta_fwd_so<32, BK, D, false, REV, 0, 1>;
+        const size_t shso = (size_t)32 * (D + PAD) * sizeof(__half) + (size_t)2 * BK * ((D + 16) + (D + 16));
+        C10_CUDA_CHECK(cudaFuncSetAttribute(kso, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shso));
+        kso<<<dim3((Sq + bqEff - 1) / bqEff, H, _ksplit), 256, shso, at::cuda::getCurrentCUDAStream()>>>(
+            reinterpret_cast<const __half*>(Q.data_ptr<at::Half>()),
+            Kc.data_ptr<int8_t>(), Kst.data_ptr<float>(),
+            Vc.data_ptr<int8_t>(), Vst.data_ptr<float>(),
+            reinterpret_cast<__half*>(O.data_ptr<at::Half>()), lse.data_ptr<float>(),
+            Sq, Sk, sc, H / Hkv, causal ? (Sk - Sq) : 0,
+            (long)H * D, (long)D, (long)Sq * H * D,
+            (long)D, 0L, 0L,
+            (long)H * D, (long)D, (long)Sq * H * D,
+            (long)lse_dim, (long)H * lse_dim,
+            0L, 0L,
+            vOff.data_ptr<long>(), vScl.data_ptr<long>(), Hkv,
+            _sI, _sC, _sStride, _sGroup, _sSub,
+            _ksplit, pOp, pLp);
+    } else
+    kern<<<dim3((Sq + bqEff - 1) / bqEff, H, _ksplit), nthr, sh, at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<const __half*>(Q.data_ptr<at::Half>()),
+        Kc.data_ptr<int8_t>(), Kst.data_ptr<float>(),
+        Vc.data_ptr<int8_t>(), Vst.data_ptr<float>(),
+        reinterpret_cast<__half*>(O.data_ptr<at::Half>()), lse.data_ptr<float>(),
+        Sq, Sk, sc, H / Hkv, causal ? (Sk - Sq) : 0,
+        (long)H * D, (long)D, (long)Sq * H * D,
+        (long)D, 0L, 0L,                       // k_sM/k_sH/k_sB при PAGED не участвуют
+        (long)H * D, (long)D, (long)Sq * H * D,
+        (long)lse_dim, (long)H * lse_dim,
+        0L, 0L,                                // ks_sH/ks_sB при PAGED не участвуют
+        nullptr, nullptr,
+        vOff.data_ptr<long>(), vScl.data_ptr<long>(), Hkv,
+        _sI, _sC, _sStride, _sGroup, _sSub,
+        _ksplit, pOp, pLp);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    if (_ksplit > 1) {
+        // Свод срезов ГОТОВЫМ ядром (оно же обслуживает cutlass-путь): веса из LSE срезов,
+        // пустые срезы отбираются по isfinite -- поэтому LSE пишут ВСЕ срезы, включая пустые.
+        const int rows = B * H * Sq, thr = (D >= 128 ? 128 : 64);
+        fwd_combine_splits_kernel<<<rows, thr, (2 * _ksplit + 3) * sizeof(float),
+                                    at::cuda::getCurrentCUDAStream()>>>(
+            Opart.data_ptr<float>(), Lpart.data_ptr<float>(),
+            reinterpret_cast<__half*>(Otmp.data_ptr<at::Half>()), Ltmp.data_ptr<float>(),
+            _ksplit, B * H, Sq, D, Sq,
+            (long)B * H * Sq * D, (long)B * H * Sq);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        // BHSD -> BSHD: перестановка дешёвая (при декоде это Sq*H*D = 4*12*256 половин = 24 КиБ).
+        O.copy_(Otmp.permute({0, 2, 1, 3}));
+        auto L2 = torch::empty({B, H, lse_dim}, torch::dtype(torch::kFloat32).device(Q.device()));
+        L2.narrow(2, 0, Sq).copy_(Ltmp);
+        return std::make_tuple(O, L2.narrow(2, 0, Sq).contiguous());
+    }
+    return std::make_tuple(O, lse.narrow(2, 0, Sq).contiguous());
+}
+
+#if FA2_PHASE
+static torch::Tensor& _fa2_phase_buf(c10::Device dev);
+#endif
 std::tuple<torch::Tensor, torch::Tensor> attn_fwd_volta_i8(
         torch::Tensor Q, torch::Tensor Kq, torch::Tensor Ks, torch::Tensor Vq, torch::Tensor Vs,
         double scale, bool causal, int64_t nosc) {
@@ -740,7 +1198,14 @@ std::tuple<torch::Tensor, torch::Tensor> attn_fwd_volta_i8(
     const char* wse0 = getenv("FA2SM70_WS");
     const int ws0 = wse0 ? atoi(wse0) : 1;
     // у ядра ролей: Q ЦЕЛИКОМ (шаг D+PAD), K ЦЕЛИКОМ на плитку, ДВОЙНОЙ буфер
-    size_t sh = ws0 ? ((size_t)(32 * (D + PAD) + 32 * (BK + PAD)) * sizeof(__half)
+    // [ГЕОМЕТРИЯ ХОСТА ОБЯЗАНА СЛЕДОВАТЬ ЗА ГЕОМЕТРИЕЙ ЯДРА -- ТРЕТИЙ СЛУЧАЙ ОДНОГО КЛАССА]
+    // Здесь стояла ЗАШИТАЯ 32 вместо BQ, хотя BQ -- переменная тремя строками выше. Пока ветвь
+    // ролей всегда брала BQ=32, это было незаметно; попытка BQ=64 давала ядру плиту на ПОЛОВИНУ
+    // нужного, оно писало за конец -- и симптом читался как «BQ=64 ВИСНЕТ», то есть как свойство
+    // ядра. На деле BQ=64 требует 111 680 Б против потолка 98 304 -- дверь закрыта РЕСУРСОМ, и
+    // это надо было увидеть арифметикой, а не зависанием. Тот же класс уже дал ложное закрытие
+    // WN=2 (счёт нитей зашит как 4+8) -- см. комментарий у выбора вариантов.
+    size_t sh = ws0 ? ((size_t)((size_t)BQ * (D + PAD) + (size_t)BQ * (BK + PAD)) * sizeof(__half)
                        + (size_t)2 * BK * ((D + 16) + (D + 16)))
                     : ((size_t)(BQ * LDQ + BQ * LDP) * sizeof(__half) + (size_t)BK * (LDK8 + LDV));
     // [СДВИГ БАНКОВОГО ОТПЕЧАТКА МЕЖДУ БЛОКАМИ]
@@ -753,9 +1218,22 @@ std::tuple<torch::Tensor, torch::Tensor> attn_fwd_volta_i8(
     // Добиваем аллокацию до смещения в ПОЛЦИКЛА (64 Б = 16 банков) -- максимальное разведение.
     // Цена: 64 байта разделяемой памяти на блок.
     if (getenv("FA2SM70_I8_NOBANKSHIFT") == nullptr) sh += 64;
+    // ЗАМЫКАНИЕ, А НЕ НАДЕЖДА: превышение потолка разделяемой даёт не сообщение, а ЗАВИСАНИЕ или
+    // тихую порчу (ядро пишет за конец своей плиты). Проверка стоит один сравнительный переход на
+    // ЗАПУСК и превращает «BQ=64 виснет» в внятный отказ с числами.
+    TORCH_CHECK(sh <= 96 * 1024, "volta fwd ws: разделяемой нужно ", sh,
+                " Б при потолке 98304 -- геометрия (BQ=", BQ, ", BK=", BK, ", d=", D,
+                ") не влезает; это РЕСУРС, а не дефект ядра");
     void (*kern)(const __half*, const int8_t*, const float*, const int8_t*, const float*, __half*,
                  float*, int, int, float, int, int, long, long, long, long, long, long,
-                 long, long, long, long, long, long, long, long long*, int*);
+                 long, long, long, long, long, long, long, long long*, int*,
+                 const long*, const long*, int,
+                 // хвост разреженного обхода (Этап 2, записка 20) -- эти пути его не задают,
+                 // но ТИП обязан совпасть с ядром, иначе присваивание указателя не проходит
+                 const int*, const int*, int, int, int,
+                 // хвост расщепления по ключам (записка 24) -- та же причина: тип указателя
+                 // обязан повторять ПОЛНУЮ подпись ядра, включая параметры с умолчаниями
+                 int, float*, float*);
     int nthr;
     // [ФАЛЬСИФИКАТОР A/B, НЕ БОЕВОЙ ПУТЬ] FA2SM70_FAKEXOR=1 подменяет e5m2 на KVFMT=2: тот же e5m2,
     // но с ОДНИМ лишним LOP3 в цепи распаковки -- ровно тем, что отличает int8 в блоке счёта.
@@ -788,6 +1266,10 @@ std::tuple<torch::Tensor, torch::Tensor> attn_fwd_volta_i8(
     const int64_t nosc_w = (wide_req && !wide_ok) ? (nosc % 100) : nosc;
     if (usews && nosc_w >= 100) {
         const int64_t f = nosc_w % 100, var = nosc_w / 100;
+        // Считающих варпов у ядра = WM*WN. Держать это числом рядом с выбором ядра, а не константой
+        // в конце ветви: расхождение даёт не «медленнее», а ОТКАЗ ЗАПУСКА, который читается как
+        // «вариант сломан». Ровно так и была ложно закрыта дверь WN=2.
+        int wsCons = 8;
 #define FA2_WS_VAR(F, W, S) (causal ? fa2_sm70::fwd_ws::volta_fwd_ws<32, BK, D, 2, 4, true,  DC, 1, REV, D, F, W, S> \
                                     : fa2_sm70::fwd_ws::volta_fwd_ws<32, BK, D, 2, 4, false, DC, 1, REV, D, F, W, S>)
 #define FA2_WS_DIAG(F, G) (causal ? fa2_sm70::fwd_ws::volta_fwd_ws<32, BK, D, 2, 4, true,  DC, 1, REV, D, F, 0, 0, G> \
@@ -796,6 +1278,15 @@ std::tuple<torch::Tensor, torch::Tensor> attn_fwd_volta_i8(
                                  : fa2_sm70::fwd_ws::volta_fwd_ws<32, BK, D, 2, 4, false, DC, 1, REV, D, F, W, 0, 0, 0, 2>)
 #define FA2_WS_PH(F, W) (causal ? fa2_sm70::fwd_ws::volta_fwd_ws<32, BK, D, 2, 4, true,  DC, 1, REV, D, F, W, 0, 0, 1> \
                                 : fa2_sm70::fwd_ws::volta_fwd_ws<32, BK, D, 2, 4, false, DC, 1, REV, D, F, W, 0, 0, 1>)
+// [KSPL] Расщепление по ключам заводится на ОБА формата: 0 -- ТОТ, ЧТО ОТГРУЖЕН (боевой путь зовёт
+// attn_fwd_volta_i8 с nosc=0), 8 -- чередующаяся таблица, на которой снимался замер фаз. Вердикт,
+// снятый только на 8, к боевому пути не переносится: это разные ветви чтения масштабов.
+// ПОРЯДОК ХВОСТА: ..., KVFMT, WIDE, SWZ, DIAG, PHSPLIT, KSP, KSPL -- СЕМЬ значений после DV.
+// Пропуск одного (было шесть) собрал PHSPLIT=1 при KSPL=0, и ответ вышел ПОБИТОВО РАВЕН базе,
+// потому что разведение фаз меняет только имена барьеров. Побитовое равенство там, где обязано
+// быть расхождение округления, -- признак того, что ЗОНД НЕ В ПУТИ, а не того, что он верен.
+#define FA2_WS_KSPL(F, S) (causal ? fa2_sm70::fwd_ws::volta_fwd_ws<32, BK, D, 2, 4, true,  DC, 1, REV, D, F, 0, 0, 0, 0, 1, S> \
+                                  : fa2_sm70::fwd_ws::volta_fwd_ws<32, BK, D, 2, 4, false, DC, 1, REV, D, F, 0, 0, 0, 0, 1, S>)
         if      (f == 0 && var == 1) kern = FA2_WS_VAR(0, 1, 0);
         else if (f == 7 && var == 1) kern = FA2_WS_VAR(7, 1, 0);
         else if (f == 8 && var == 1) kern = FA2_WS_VAR(8, 1, 0);
@@ -805,8 +1296,68 @@ std::tuple<torch::Tensor, torch::Tensor> attn_fwd_volta_i8(
         // побитово, -- и умолчание включено. Вход оставлен: он равен умолчанию, а базу для
         // повторного A/B теперь даёт FA2SM70_WS_SWZ=0.
         else if (f == 11 && var == 4) kern = FA2_WS_VAR(11, 0, 1);
+        // [ГЕОМЕТРИЯ РОЛЕВОГО ЯДРА НЕ МЕНЯЕТСЯ ШАБЛОННЫМ ПАРАМЕТРОМ -- ПРОВЕРЕНО ДВАЖДЫ, 15.08.2026]
+        // Замер по фазам: у считающих 38.9 % периода -- МЕЖВАРПОВОЕ СВЕДЕНИЕ максимума, а
+        // поэлементный проход всего 2.9 %. Напрашивались две правки геометрии, обе отвергнуты:
+        //   BQ=64 (WM 2->4): СОБИРАЕТСЯ и ВИСНЕТ -- роли варпов и счёт защёлок жёстко связаны
+        //                    ("первая половина везёт, вторая считает"; bar.sync ждёт kAllThr);
+        //   WN=4 -> WN=2:    СОБИРАЕТСЯ и ОТВЕРГАЕТСЯ ЗАПУСКОМ (cudaErrorInvalidValue).
+        // Регистры при этом НЕ стена: cuobjdump -res-usage даёт REG 126..134, LOCAL 0, STACK 0 при
+        // потолке ISA 255.
+        //
+        // [ПОПРАВКА 16.08.2026 -- ПРИЧИНА ОТКАЗА WN=2 НАЙДЕНА, И ОНА В ХОСТЕ, А НЕ В ЯДРЕ]
+        // Счёт СЧИТАЮЩИХ варпов был зашит в `nthr` числом 8 (= WM*WN при WN=4). Ядро с WN=2
+        // объявляет в __launch_bounds__ (4+4)*32 = 256 нитей, а хост пускал его на 384 -- это и
+        // есть cudaErrorInvalidValue. То есть дверь была закрыта ДЕФЕКТОМ ПУСКА, а не замером, и
+        // формулировка «геометрия не меняется шаблонным параметром» держалась на нём же.
+        // Почему это важно именно сейчас: укладчик (`tools/kanal_ili_cep.py`) даёт по машинному
+        // коду ResMII 2786 при RecMII 0 -- связывает КАНАЛ (MIO 99.1 % при тензорной трубе
+        // 73.5 %), а не цепь. Операнд A первого умножения (Q) читается из разделяемой ВНУТРИ
+        // цикла по k, по одной загрузке на 4 шага, и это ОДИН И ТОТ ЖЕ Q на всех плитках ключей.
+        // Ширина полосы варпа по ключам SN = BK/WN задаёт, сколько ключей обслуживает одно чтение
+        // A: при WN=2 она вдвое шире, и трафик A НА КЛЮЧ падает вдвое. Это прямой рычаг по
+        // связывающему каналу, а не по счёту команд вообще.
+        // `nthr` теперь считается ПО ВЫБРАННОМУ ЯДРУ (wsCons), а не по умолчанию.
+        // [KSPL -- РАСЩЕПЛЕНИЕ ПО КЛЮЧАМ, СО СВОДОМ В ЭПИЛОГЕ] var=7. Ответ ВЕРЕН: каждый варп
+        // ведёт свою полосу ключей и свою тройку (O, m, l), склейка одна на блок.
+        else if (var == 7 && (f == 0 || f == 8)) kern = (f == 0) ? FA2_WS_KSPL(0, 1) : FA2_WS_KSPL(8, 1);
+        // ФАЛЬСИФИКАТОРЫ ПЕРЕМАСШТАБИРОВАНИЯ, ПАРА: 8 -- расщепление без него, 9 -- БАЗА без него.
+        // Ответ НЕВЕРЕН у обоих; читается только разность времени с 7 и 0 соответственно.
+        else if (var == 8 && (f == 0 || f == 8)) kern = (f == 0) ? FA2_WS_KSPL(0, 2) : FA2_WS_KSPL(8, 2);
+        else if (var == 9 && (f == 0 || f == 8)) kern = (f == 0) ? FA2_WS_DIAG(0, 7) : FA2_WS_DIAG(8, 7);
+        // [WN=2 -- ПОЛОСА ВАРПА ПО КЛЮЧАМ ВДВОЕ ШИРЕ] var=5. Трафик операнда A (Q) на КЛЮЧ падает
+        // вдвое: одно чтение фрагмента обслуживает SN=32 ключа вместо 16. Считающих становится 4,
+        // и nthr обязан это учесть -- иначе тот же отказ запуска, что закрыл дверь в прошлый раз.
+        //
+        // [ЗАМЕРЕНО 16.08.2026 -- ТЕПЕРЬ ДВЕРЬ ЗАКРЫТА ЧЕСТНО] Вариант ЗАПУСКАЕТСЯ и ВЕРЕН
+        // (relL2 к базе 4.2e-6, к fp32-эталону РОВНО как у базы, пять форм). Время: x0.676 /
+        // x0.755 / x0.797 при Sk = 4096 / 16384 / 46002 -- заметно ХУЖЕ. Причина: WN=2 режет
+        // считающих с 8 до 4, блок становится 8 варпов вместо 12. Трафик A на ключ действительно
+        // упал вдвое, но насыщать связывающий канал (MIO) стало нечем. Счётный довод ПО ТОМУ
+        // САМОМУ каналу, который назвал укладчик, всё равно не перешёл во время -- потому что
+        // ResMII считает занятость канала при ДОСТАТОЧНОМ числе варпов, а их стало меньше.
+        // Чтобы взять этот рычаг, нужно сохранить 8 считающих: WM=4/WN=2, то есть BQ=64. Она
+        // требует 111 680 Б разделяемой при потолке 98 304 -- закрыто РЕСУРСОМ (проверка ниже).
+        else if (var == 5 && (f == 0 || f == 8)) {
+            wsCons = 4;
+            kern = (f == 0)
+                ? (causal ? fa2_sm70::fwd_ws::volta_fwd_ws<32, BK, D, 2, 2, true,  DC, 1, REV, D, 0>
+                          : fa2_sm70::fwd_ws::volta_fwd_ws<32, BK, D, 2, 2, false, DC, 1, REV, D, 0>)
+                : (causal ? fa2_sm70::fwd_ws::volta_fwd_ws<32, BK, D, 2, 2, true,  DC, 1, REV, D, 8>
+                          : fa2_sm70::fwd_ws::volta_fwd_ws<32, BK, D, 2, 2, false, DC, 1, REV, D, 8>);
+        }
         else if (f == 8 && var == 30) kern = FA2_WS_KSP(8, 0);   // расщепление цепочки накопителя
         else if (f == 8 && var == 20) kern = FA2_WS_PH(8, 0);   // разведение фаз по группам строк
+        // [ФАЛЬСИФИКАТОРЫ НА ОТГРУЖАЕМОМ ФОРМАТЕ 0] Весь прежний бюджет фаз снимался на формате 8,
+        // а боевой путь идёт nosc=0 -- то есть ДРУГАЯ ветвь чтения масштабов (два раздельных
+        // массива против чередующегося) и другой счёт обращений к разделяемой. Вердикт с 8 на 0
+        // не переносится, и это не педантизм: MIO у этого тела -- связывающий канал (99.1 %).
+        else if (f == 0 && var >= 11 && var <= 16) kern = (var == 11 ? FA2_WS_DIAG(0, 1)
+                                                        : var == 12 ? FA2_WS_DIAG(0, 2)
+                                                        : var == 13 ? FA2_WS_DIAG(0, 3)
+                                                        : var == 14 ? FA2_WS_DIAG(0, 4)
+                                                        : var == 15 ? FA2_WS_DIAG(0, 5)
+                                                                    : FA2_WS_DIAG(0, 6));
         else if (f == 8 && var == 11) kern = FA2_WS_DIAG(8, 1);   // ФАЛЬСИФИКАТОР: без софтмакса
         else if (f == 8 && var == 12) kern = FA2_WS_DIAG(8, 2);   // ФАЛЬСИФИКАТОР: без внутренних защёлок
         else if (f == 8 && var == 13) kern = FA2_WS_DIAG(8, 3);   // ФАЛЬСИФИКАТОР: без второго умножения
@@ -815,10 +1366,15 @@ std::tuple<torch::Tensor, torch::Tensor> attn_fwd_volta_i8(
         else if (f == 8 && var == 16) kern = FA2_WS_DIAG(8, 6);   // ФАЛЬСИФИКАТОР: ОБА умножения сняты   // ФАЛЬСИФИКАТОР: без первого умножения
         else TORCH_CHECK(false, "volta fwd i8: нет варианта для nosc=", nosc);
 #undef FA2_WS_KSP
+#undef FA2_WS_KSPL
 #undef FA2_WS_PH
 #undef FA2_WS_DIAG
 #undef FA2_WS_VAR
-        nthr = (4 + 8) * 32;
+        // ЧИСЛО НИТЕЙ ОБЯЗАНО СЛЕДОВАТЬ И ЗА FA2_WSPROD, И ЗА ГЕОМЕТРИЕЙ ВЫБРАННОГО ЯДРА.
+        // Зашитые «4 везущих + 8 считающих» означали, что любое ядро с другой сеткой запускается с
+        // ЧУЖИМ счётом нитей: отказ запуска в лучшем случае и несходящийся bar.sync в худшем.
+        // Именно так была ложно закрыта дверь WN=2 (ядро объявляет 256 нитей, пускалось на 384).
+        nthr = ((FA2_WSPROD > 0 ? FA2_WSPROD : wsCons) + wsCons) * 32;
     } else if (usews) {   // роли: везущие + считающие, один блок
         const int64_t nosc = nosc_w;   // откат с широкой перекладки попадает сюда
         // ОДИН выключатель перестановки K-группы на ОБА формата (8 и 11). Раздельные вентили здесь
@@ -896,7 +1452,10 @@ std::tuple<torch::Tensor, torch::Tensor> attn_fwd_volta_i8(
                                 : fa2_sm70::fwd_ws::volta_fwd_ws<32, BK, D, 2, 4, false, DC, 1, REV, D, 1>;
         else      kern = causal ? fa2_sm70::fwd_ws::volta_fwd_ws<32, BK, D, 2, 4, true,  DC, 1, REV, D>
                       : fa2_sm70::fwd_ws::volta_fwd_ws<32, BK, D, 2, 4, false, DC, 1, REV, D>;
-        nthr = (4 + 8) * 32;
+        // ЧИСЛО НИТЕЙ ОБЯЗАНО СЛЕДОВАТЬ ЗА FA2_WSPROD: оно же стоит в __launch_bounds__ ядра.
+        // Зашитая четвёрка означала, что сборка с другим числом везущих запускается с ЧУЖИМ
+        // счётом нитей -- отказ запуска в лучшем случае и несходящийся bar.sync в худшем.
+        nthr = ((FA2_WSPROD > 0 ? FA2_WSPROD : 8) + 8) * 32;
     } else if (i8occ) {   // BQ=32: законна только сетка 2x4 (при WM=4 выходит SM=8, не кратно 16)
         kern = causal ? fa2_sm70::fwd_i8::volta_fwd_i8<32, BK, D, 2, 4, true,  DC, 2, REV, D>
                       : fa2_sm70::fwd_i8::volta_fwd_i8<32, BK, D, 2, 4, false, DC, 2, REV, D>;
@@ -921,10 +1480,41 @@ std::tuple<torch::Tensor, torch::Tensor> attn_fwd_volta_i8(
         // ЧЕРЕДУЮЩАЯСЯ таблица -- две fp32 на позицию, поэтому шаги ВДВОЕ (ядро смещает Ks в
         // единицах float, а читает как float2). Прочие форматы -- как было.
         ((fmt == 8 || fmt == 10) ? (long)2 * Sk : (long)Sk),
-        ((fmt == 8 || fmt == 10) ? (long)2 * Hkv * Sk : (long)Hkv * Sk), nullptr, nullptr);
+        ((fmt == 8 || fmt == 10) ? (long)2 * Hkv * Sk : (long)Hkv * Sk),
+#if FA2_PHASE
+        // [ЗАМЕР ФАЗ РОЛЕЙ ПОДКЛЮЧЁН К ХОСТУ] Прибор в ядре был готов (параметр phase_acc, PH_OUT
+        // РАЗДЕЛЬНО у везущих и у считающих), но хост передавал nullptr -- то есть включённый
+        // замер писал бы в ноль-указатель. Буфер живёт ТОЛЬКО под FA2_PHASE: боевая сборка не
+        // меняется ни на инструкцию, и сравнивать её с замерочной по времени НЕЛЬЗЯ (clock64 и
+        // атомарные сложения сами стоят).
+        reinterpret_cast<long long*>(_fa2_phase_buf(Q.device()).data_ptr<int64_t>()), nullptr,
+        nullptr, nullptr, 0, nullptr, nullptr, 0, 1, 0,
+        // расщепления по ключам этот путь не использует. Через УКАЗАТЕЛЬ умолчания
+        // параметров НЕ подставляются -- перечислять обязательно.
+        1, nullptr, nullptr);
+#else
+        nullptr, nullptr, nullptr, nullptr, 0, nullptr, nullptr, 0, 1, 0,
+        // расщепления по ключам этот путь не использует. Через УКАЗАТЕЛЬ умолчания
+        // параметров НЕ подставляются -- перечислять обязательно.
+        1, nullptr, nullptr);
+#endif
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return std::make_tuple(O, lse.narrow(2, 0, Sq).contiguous());
 }
+
+#if FA2_PHASE
+// Один буфер на процесс: фазы копятся атомарно со всех блоков, читаются как ПРОПОРЦИИ.
+static torch::Tensor& _fa2_phase_buf(c10::Device dev) {
+    static torch::Tensor b = torch::zeros({16}, torch::dtype(torch::kInt64).device(dev));
+    return b;
+}
+torch::Tensor fa2_phase_read_reset() {
+    auto& b = _fa2_phase_buf(torch::Device(torch::kCUDA, 0));
+    auto out = b.clone();
+    b.zero_();
+    return out;
+}
+#endif
 
 std::tuple<torch::Tensor, torch::Tensor> attn_fwd_vsplit(torch::Tensor, torch::Tensor, torch::Tensor, double, bool);
 std::tuple<torch::Tensor, torch::Tensor> attn_fwd_volta(torch::Tensor, torch::Tensor, torch::Tensor, double, bool);
@@ -933,6 +1523,13 @@ std::tuple<torch::Tensor, torch::Tensor> attn_fwd_volta(torch::Tensor, torch::Te
 // заданной, поэтому FA2SM70_NO_VOLTA_FWD="" молча включал бы откат -- в A/B это делает обе ветви
 // одинаковыми и читается как «ускорения нет». Ровно эта ошибка уже стоила одного ложного замера
 // сегодня (переключатель, не подключённый к измеряемому коду, даёт совпадение точнее шума).
+// Развилка «блоков меньше, чем SM» -> ключевое расщепление. Гейт нужен, чтобы фальсифицировать
+// её на боевом сервере одной переменной, не пересобирая.
+static inline bool fwd_splitk_disabled() {
+    static const bool off = getenv("FA2SM70_NO_FWD_SPLITK") != nullptr;
+    return off;
+}
+
 static inline bool volta_fwd_disabled() {
     const char* e = getenv("FA2SM70_NO_VOLTA_FWD");
     return e && *e && *e != '0';
@@ -967,6 +1564,27 @@ std::tuple<torch::Tensor, torch::Tensor> attn_fwd_qbshd(torch::Tensor Q, torch::
     // changes layout handling): measured at 16384, not 8192. See the table there.
     if (d <= 128) return (Sk >= 16384) ? run_fmha_qbshd<64, 128, 128>(Q, K, V, scale, causal)
                                       : run_fmha_qbshd<32, 128, 128>(Q, K, V, scale, causal);
+    // РАЗВИЛКА ПО ЧИСЛУ БЛОКОВ (07.08.2026). Рукописный мейнлуп сильнее ВЕЗДЕ, где машина набита,
+    // но его сетка -- (плитки запросов) x H x B, и при коротком куске запросов блоков остаётся
+    // считанные единицы. ЗАМЕРЕНО (H=12, Hkv=2, d=256, Sk=63000): при Sq<=64 боевой путь берёт
+    // 8.10-8.23 мс, тогда как крыша по чтению этих же ключей 0.148 мс -- x55. Связывает не работа,
+    // а ПУСТАЯ МАШИНА: 12-24 блока на 80 SM. Расщепление по ключам даёт те же биты за 1.29-3.29 мс.
+    // Порог -- не «Sq маленькое», а «блоков меньше, чем SM»: это же условие само подстроится под
+    // другое H, другую карту и батч. Разворот Q/O стоит Sq*H*d*2 байт (при Sq=64 это 393 КБ
+    // против 63 МБ ключей), поэтому в зачёт не идёт.
+    if (d == 256 && causal && Sk >= 8192 && Sk >= Sq && !fwd_splitk_disabled()) {
+        int dev = 0, nsm = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, dev);
+        if (nsm <= 0) nsm = 80;
+        const long nblocks = (long)((Sq + 31) / 32) * H * Q.size(0);
+        if (nblocks < (long)nsm) {
+            auto Qh = Q.transpose(1, 2).contiguous();                      // BSHD -> BHSD
+            auto r = run_fmha<32, 128, 256>(Qh, K, V, scale, causal, 0, 0.0, nullptr, -1);
+            auto O = std::get<0>(r).transpose(1, 2).contiguous();          // BHSD -> BSHD
+            return std::make_tuple(O, std::get<1>(r));
+        }
+    }
     if (d == 256 && Sk >= Sq && !volta_fwd_disabled()) {
         // РУКОПИСНЫЙ МЕЙНЛУП. Замер на серверной геометрии (V100, частоты зафиксированы, causal,
         // чанк 8192 запросов), отгруженный путь cutlass -> этот, полезные TFLOP/s:
@@ -1157,12 +1775,50 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("Q"), pybind11::arg("K"), pybind11::arg("V"), pybind11::arg("scale"), pybind11::arg("causal"));
     m.def("attn_fwd_volta", &attn_fwd_volta,
           "sm70 hand-written block mainloop FMHA forward (head_dim 256, BSHD in/out)");
+    m.def("sparse_select_rows", &fa2sm70_sparse_select_rows,
+          "FA2/SM70: отбор блоков для ДЕКОДА -- длина на строку, буферы предвыделены вызывающим; grp -- группа строк; topf -- отбор ПО СТРОКЕ верхней долей блоков; qGrp/qCausal -- виртуальный батч (длины и таблица ПО ЗАПРОСУ) minblk -- ПОЛ по числу блоков (короткий контекст становится плотным сам собой)",
+          pybind11::arg("Q"), pybind11::arg("kbarPool"), pybind11::arg("BlockTable"),
+          pybind11::arg("seqLens"), pybind11::arg("kvStart"), pybind11::arg("scale"),
+          pybind11::arg("alpha"), pybind11::arg("B"), pybind11::arg("cnt"), pybind11::arg("idx"),
+          pybind11::arg("mBuf"), pybind11::arg("sBuf"), pybind11::arg("bs"),
+          pybind11::arg("SINK") = 2, pybind11::arg("WIN") = 8, pybind11::arg("REC") = 2,
+          pybind11::arg("devPool") = c10::nullopt, pybind11::arg("gamma") = 0.0,
+          pybind11::arg("grp") = 1, pybind11::arg("topf") = 0.0,
+          pybind11::arg("qGrp") = 1, pybind11::arg("qCausal") = 1,
+          pybind11::arg("minblk") = 1);
+    m.def("blk_mean_update", &fa2sm70_blk_mean_update,
+          "FA2/SM70: обновить средние ключи ПО ТРОНУТЫМ подблокам (зовётся после записи KV)",
+          pybind11::arg("Kc"), pybind11::arg("Kst"), pybind11::arg("slot_mapping"),
+          pybind11::arg("kbarPool"), pybind11::arg("B") = 128, pybind11::arg("devPool") = c10::nullopt);
+    m.def("sparse_select", &fa2sm70_sparse_select,
+          "FA2/SM70: отбор блоков ключей по средним ключам (записка 20) -> (cnt, idx, kbar)",
+          pybind11::arg("Q"), pybind11::arg("Kc"), pybind11::arg("Kst"), pybind11::arg("BlockTable"),
+          pybind11::arg("T"), pybind11::arg("scale"), pybind11::arg("alpha"),
+          pybind11::arg("B") = 128, pybind11::arg("TI") = 128, pybind11::arg("PROBE") = 16,
+          pybind11::arg("SINK") = 2, pybind11::arg("WIN") = 8, pybind11::arg("REC") = 2,
+          pybind11::arg("kbarPool") = c10::nullopt, pybind11::arg("beta") = 0.0,
+          pybind11::arg("gamma") = 0.0, pybind11::arg("devPool") = c10::nullopt);
+    m.def("attn_fwd_volta_i8_paged", &attn_fwd_volta_i8_paged,
+          "sm70 prefill: K/V straight from the paged int8 pool (task 163, one HBM pass)",
+          pybind11::arg("Q"), pybind11::arg("Kc"), pybind11::arg("Vc"),
+          pybind11::arg("Kst"), pybind11::arg("Vst"), pybind11::arg("BlockTable"),
+          pybind11::arg("T"), pybind11::arg("scale"), pybind11::arg("causal"),
+          // Индекс отбора -- НЕОБЯЗАТЕЛЬНЫЙ хвост: без него вызов и ответ прежние.
+          pybind11::arg("selCnt") = c10::nullopt, pybind11::arg("selIdx") = c10::nullopt,
+          pybind11::arg("selTI") = 128, pybind11::arg("selB") = 128,
+          // Буфер выхода -- тоже необязательный: без него поведение прежнее (ядро выделяет
+          // само и возвращает). С ним выделение и копия у хозяина исчезают.
+          pybind11::arg("Out") = c10::nullopt);
     m.def("attn_fwd_volta_i8", &attn_fwd_volta_i8,
           "sm70 forward with int8 K/V (new-foundation kernel: transport law satisfied)",
           pybind11::arg("Q"), pybind11::arg("Kq"), pybind11::arg("Ks"),
           pybind11::arg("Vq"), pybind11::arg("Vs"), pybind11::arg("scale"), pybind11::arg("causal"),
           pybind11::arg("nosc") = 0);
-    m.def("attn_fwd_volta_i8_nosc", &attn_fwd_volta_i8_nosc,
+  #if FA2_PHASE
+  m.def("fa2_phase_read_reset", &fa2_phase_read_reset,
+        "накопители фаз ролевого ядра [8] и обнуление (только сборка с -DFA2_PHASE=1)");
+#endif
+  m.def("attn_fwd_volta_i8_nosc", &attn_fwd_volta_i8_nosc,
           "sm70 forward with int8 K/V and COLUMNWISE scale folded outside the kernel (no scale table)",
           pybind11::arg("Q"), pybind11::arg("Kq"), pybind11::arg("Vq"),
           pybind11::arg("scale"), pybind11::arg("causal"));

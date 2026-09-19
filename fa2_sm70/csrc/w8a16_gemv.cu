@@ -30,6 +30,7 @@
 // One column per THREAD also removes the cross-lane reduction entirely: each thread owns a whole
 // output element and writes it once.
 #include <torch/extension.h>
+#include <unordered_map>
 #include <c10/cuda/CUDAException.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_fp16.h>
@@ -62,13 +63,183 @@ constexpr int xtile_of(int MT) { int t = XSMEM / MT; return t > 1024 ? 1024 : (t
 // inner step into 1 LDS.128 + 4 FFMA per row per weight word, down from ~13 instructions. ptxas showed
 // no spill in either version, so the first MT=16 result (0.28x) was pure instruction issue, not
 // occupancy -- the fp32 SIMT pipe is the wall at high MT, which is exactly what tensor cores exist for.
+
+// ============================ ЧЕТЫРЁХСТОЛБЦОВЫЙ ВАРИАНТ ============================
+// [ПОЧЕМУ ОН ЕСТЬ -- НАЗВАНО МАШИННЫМ КОДОМ, А НЕ ДОГАДКОЙ]
+// Укладчик по телу мейнлупа (tools/kanal_ili_cep.py): у НАС связывает MIO на 100 % при 144
+// командах этого канала, у чужого `vllm::gptq::gemm_half_q_half_gptq_8bit` -- FPU, а MIO всего
+// 13.8 % при 64 командах. Разбор SASS показал ровно причину: у чужого есть `LDG.E.128`, у нас его
+// НЕТ ВОВСЕ -- вес читается 32-разрядными загрузками. Байт столько же, команд вчетверо больше, и
+// на теле, связанном этим каналом, это и есть потеря (замер на месте: 74.5 мкс против 66.9).
+//
+// ХОД. Раскладка `qweight [K/4, N]` по N НЕПРЕРЫВНА, значит один поток может взять ЧЕТЫРЕ соседних
+// столбца одним `uint4`. Даром достаётся и второе: `qzeros` пакует РОВНО 4 столбца в слово, то есть
+// одна загрузка нуля обслуживает все четыре -- ни сдвига, ни маски. Масштабы (4 подряд `__half`)
+// берутся одним 64-разрядным чтением.
+//
+// ТОЧНОСТЬ НЕ ТРОГАЕТСЯ: та же арифметика в fp32, тот же порядок суммирования по k, та же
+// условность нуля. Меняется ТОЛЬКО ширина обращения -- это размещение, а не вычисление.
+// [ШИРИНА СТОЛБЦОВ -- ПАРАМЕТР, А НЕ КОНСТАНТА. ЗАМЕР РЕГИСТРОВ 25.08]
+// ptxas -v на этом самом ядре: MT=1 -> 63 рег (32 варпа/SM), MT=2 -> 79 (24), MT=4 -> 114 (16),
+// MT=8 -> 156 (8 варпов из 64). Занятость обваливается ровно там, где падает полоса:
+// down 8704x5120 даёт 687 ГБ/с при M=1, 522 при M=4 и 293 при M=8. То есть при M>1 ядро
+// перестаёт прятать латентность HBM -- не из-за счёта, а из-за НЕХВАТКИ ВАРПОВ.
+// Регистры считаны поимённо: acc[MT][VW] + qa[MT][VW] + g[VW][4] + s[VW] + z[VW]. Половина из
+// них масштабируется ШИРИНОЙ СТОЛБЦОВ, и она была прибита четвёркой. Делаем её параметром:
+// при MT>=4 берём VW=2 -- чтение остаётся векторным (LDG.64, 256 нитей * 8 Б = 2 КиБ подряд),
+// а регистров вдвое меньше на этой половине.
+template <int THREADS, int MT, bool SPLIT, int VW = 4>
+__global__ void w8a16_gemv4_kernel(const __half* __restrict__ x,
+                                   const int* __restrict__ qweight,
+                                   const int* __restrict__ qzeros,
+                                   const __half* __restrict__ scales,
+                                   __half* __restrict__ y, float* __restrict__ ypart,
+                                   int M, int N, int K, int G, int groups_per_split, int m0,
+                                   float zbias) {
+  constexpr int XT = xtile_of(MT);
+  constexpr bool GSUM = (MT > 1);
+  __shared__ float sx[MT][XT];
+  __shared__ float gs[GSUM ? MT : 1][GSUM ? MAXG : 1];
+  const int n0 = (blockIdx.x * THREADS + threadIdx.x) * VW;  // VW столбцов на нить
+  const bool live = (n0 + VW - 1 < N);
+  const int nw = n0 >> 2;                                    // слово qzeros на ЧЕТЫРЕ столбца
+  const int nb = n0 & 3;                                     // наш сдвиг внутри слова
+  const int mrows = min(MT, M - m0);
+
+  const int kbeg = SPLIT ? blockIdx.y * groups_per_split * G : 0;
+  const int kend = SPLIT ? min(K, kbeg + groups_per_split * G) : K;
+  if (kbeg >= kend) return;
+
+  float acc[MT][VW];
+  #pragma unroll
+  for (int mm = 0; mm < MT; ++mm)
+    #pragma unroll
+    for (int c = 0; c < VW; ++c) acc[mm][c] = 0.f;
+
+  for (int k0 = kbeg; k0 < kend; k0 += XT) {
+    const int len = min(XT, kend - k0);
+    const int ng = (len + G - 1) / G;
+    __syncthreads();
+    for (int t = threadIdx.x; t < len * mrows; t += THREADS) {
+      const int mm = t / len, kk = t - mm * len;
+      sx[mm][kk] = __half2float(x[(long)(m0 + mm) * K + k0 + kk]);
+    }
+    __syncthreads();
+    if constexpr (GSUM) {
+      for (int t = threadIdx.x; t < ng * mrows; t += THREADS) {
+        const int mm = t / ng, g = t - mm * ng;
+        float a = 0.f;
+        for (int i = g * G; i < min((g + 1) * G, len); ++i) a += sx[mm][i];
+        gs[mm][g] = a;
+      }
+      __syncthreads();
+    }
+    if (!live) continue;
+    for (int gk = 0; gk < len; gk += G) {
+      const int g = (k0 + gk) / G;
+      // масштабы: 4 подряд __half = 8 байт одним чтением
+      float s[VW];
+      #pragma unroll
+      for (int c = 0; c < VW; c += 2) {
+        const __half2 h2 = *reinterpret_cast<const __half2*>(scales + (long)g * N + n0 + c);
+        s[c] = __low2float(h2); s[c + 1] = __high2float(h2);
+      }
+      // нули: ОДНО слово qzeros несёт ровно наши четыре столбца
+      const unsigned zw = (unsigned)qzeros[(long)g * (N >> 2) + nw];
+      // [СМЕЩЕНИЕ РАЗВОРОТА СВОРАЧИВАЕТСЯ В НОЛЬ -- ЦЕНА РОВНО НОЛЬ]
+      // Разворот ниже даёт не q, а (1024 + q). Подстановка:
+      //     s*(sum x*q - z*sum x) = s*(sum x*(1024+q) - (z + 1024)*sum x)
+      // Сумма x у нас УЖЕ есть (её считает та же поправка на ноль), поэтому 1024 просто уезжает
+      // в константу нуля и не стоит ни одной команды.
+      float z[VW];
+      #pragma unroll
+      for (int c = 0; c < VW; ++c) z[c] = (float)((zw >> (8 * (nb + c))) & 0xFF) + zbias + 1024.0f;
+      const int glen = min(G, len - gk);
+      float qa[MT][VW], xa[MT];
+      #pragma unroll
+      for (int mm = 0; mm < MT; ++mm) {
+        xa[mm] = 0.f;
+        #pragma unroll
+        for (int c = 0; c < VW; ++c) qa[mm][c] = 0.f;
+      }
+      #pragma unroll 4
+      for (int k = 0; k < glen; k += 4) {
+        // ОДНА LDG.128 вместо четырёх LDG.32: четыре СТОЛБЦА подряд, у каждого свои 4 k
+        unsigned wc[VW];
+        if constexpr (VW == 4) {
+          const uint4 w4 = *reinterpret_cast<const uint4*>(
+              qweight + (long)((k0 + gk + k) >> 2) * N + n0);
+          wc[0] = w4.x; wc[1] = w4.y; wc[2] = w4.z; wc[3] = w4.w;
+        } else {
+          const uint2 w2 = *reinterpret_cast<const uint2*>(
+              qweight + (long)((k0 + gk + k) >> 2) * N + n0);
+          wc[0] = w2.x; wc[1] = w2.y;
+        }
+        // [РАЗВОРОТ БАЙТА -- ДВЕ ПЕРЕСТАНОВКИ ВМЕСТО ДВЕНАДЦАТИ КОМАНД]  §1b библиотеки примитивов
+        // Было на каждый байт: SHF + LOP3 + I2F. Разбор SASS после vec4 показал, что стена
+        // переехала с MIO (100 % -> 18.4 %) на ISSUE/ALU, и в теле сидят I2F.U8 x1076, SHF x556,
+        // LOP3 x441 -- то есть связывает именно РАЗВОРОТ, а не умножение и не память.
+        // `__byte_perm(w, 0x64646464, sel)` собирает полуслово [байт, 0x64] = fp16-число 1024+u.
+        // Байт GPTQ БЕЗЗНАКОВЫЙ, поэтому XOR со знаком (нужный KV-кэшу) здесь не требуется вовсе:
+        // две команды на четыре байта. Смещение 1024 уже свёрнуто в ноль выше.
+        // ТОЧНОСТЬ: (1024+q) представимо в fp16 ТОЧНО (шаг мантиссы там ровно 1 при q<=255), а
+        // произведения растут лишь впятеро против сигнала -- ошибка fp32-суммы ~5e-6 при нашем
+        // уровне 2.05e-4, то есть на два порядка ниже. Это тот же приём и та же оценка, что у
+        // смещения 1152 в ядре внимания.
+        float g[VW][4];
+        #pragma unroll
+        for (int c = 0; c < VW; ++c) {
+          const uint32_t f01 = __byte_perm(wc[c], 0x64646464u, 0x4140);
+          const uint32_t f23 = __byte_perm(wc[c], 0x64646464u, 0x4342);
+          const float2 a01 = __half22float2(*reinterpret_cast<const __half2*>(&f01));
+          const float2 a23 = __half22float2(*reinterpret_cast<const __half2*>(&f23));
+          g[c][0] = a01.x; g[c][1] = a01.y; g[c][2] = a23.x; g[c][3] = a23.y;
+        }
+        #pragma unroll
+        for (int mm = 0; mm < MT; ++mm) {
+          const float4 a = *reinterpret_cast<const float4*>(&sx[mm][gk + k]);
+          #pragma unroll
+          for (int c = 0; c < VW; ++c) {
+            qa[mm][c] = fmaf(a.x, g[c][0], qa[mm][c]);
+            qa[mm][c] = fmaf(a.y, g[c][1], qa[mm][c]);
+            qa[mm][c] = fmaf(a.z, g[c][2], qa[mm][c]);
+            qa[mm][c] = fmaf(a.w, g[c][3], qa[mm][c]);
+          }
+          if constexpr (!GSUM) xa[mm] += a.x + a.y + a.z + a.w;
+        }
+      }
+      #pragma unroll
+      for (int mm = 0; mm < MT; ++mm) {
+        const float sx_sum = GSUM ? gs[mm][gk / G] : xa[mm];
+        #pragma unroll
+        for (int c = 0; c < VW; ++c)
+          acc[mm][c] = fmaf(s[c], qa[mm][c] - z[c] * sx_sum, acc[mm][c]);
+      }
+    }
+  }
+  if (!live) return;
+  #pragma unroll
+  for (int mm = 0; mm < MT; ++mm)
+    #pragma unroll
+    for (int c = 0; c < VW; ++c) {
+      // [ДЕТЕРМИНИРОВАННЫЙ СВОД] Здесь стоял atomicAdd, и это делало ответ НЕПОВТОРЯЕМЫМ:
+      // сложение float атомарно идёт в ПОРЯДКЕ ПРИХОДА блоков, а он меняется от пуска к пуску.
+      // Отчёт падений §8-кватер меряет это как дрожание логитов +-0.003; на вырожденных
+      // выдачах оно переворачивает выбор токена. Пишем в СВОЙ слот расщепления, свод -- в
+      // фиксированном порядке эпилогом. Обнуление площадки при этом больше не нужно:
+      // все использованные слоты перезаписываются целиком.
+      if constexpr (SPLIT) ypart[(long)blockIdx.y * M * N + (long)(m0 + mm) * N + n0 + c] = acc[mm][c];
+      else                 y[(long)(m0 + mm) * N + n0 + c] = __float2half(acc[mm][c]);
+    }
+}
+
 template <int THREADS, int MT, bool SPLIT>
 __global__ void w8a16_gemv_kernel(const __half* __restrict__ x,
                                   const int* __restrict__ qweight,
                                   const int* __restrict__ qzeros,
                                   const __half* __restrict__ scales,
                                   __half* __restrict__ y, float* __restrict__ ypart,
-                                  int M, int N, int K, int G, int groups_per_split, int m0) {
+                                  int M, int N, int K, int G, int groups_per_split, int m0, float zbias) {
   constexpr int XT = xtile_of(MT);
   // At MT=1 the precomputed group sum does not pay: it saves 3 adds per element for a SINGLE row but
   // costs a barrier and a pass that only ng threads take part in (measured 2.56x -> 2.31x). Above one
@@ -116,7 +287,14 @@ __global__ void w8a16_gemv_kernel(const __half* __restrict__ x,
     for (int gk = 0; gk < len; gk += G) {
       const int g = (k0 + gk) / G;
       const float s = __half2float(scales[(long)g * N + n]);
-      const float z = (float)((qzeros[(long)g * (N >> 2) + nw] >> nsh) & 0xFF);
+      // [УСЛОВНОСТЬ НУЛЯ -- НЕ ДЕТАЛЬ ФОРМАТА, А ОДИН УРОВЕНЬ КВАНТА НА КАЖДОМ ВЕСЕ]
+      // GPTQ v1 (`checkpoint_format: gptq`) хранит (z-1), v2 (`gptq_v2`) хранит z. Ядро читало
+      // СЫРОЕ значение, то есть жило по v2, а боевой слепок Qwen3.8 -- v1. Промах на единицу даёт
+      // систематическую ошибку ~1/sigma_q ~ 1.4 %: ЗАМЕРЕНО 16.08 против чужого тела -- 5.55e-3 при
+      // v1 и 1.20e-3 (= округление вывода в fp16) при v2. Он НЕ ПАДАЕТ и НЕ ВИДЕН на глаз, поэтому
+      // условность обязана приходить СНАРУЖИ, а не подразумеваться. При верной условности наше тело
+      // точнее чужого: 2.04e-4 против 1.18e-3 к fp32-эталону.
+      const float z = (float)((qzeros[(long)g * (N >> 2) + nw] >> nsh) & 0xFF) + zbias;
       const int glen = min(G, len - gk);
       float qa[MT], xa[MT];
       #pragma unroll
@@ -145,20 +323,41 @@ __global__ void w8a16_gemv_kernel(const __half* __restrict__ x,
   #pragma unroll
   for (int mm = 0; mm < MT; ++mm) {
     if (mm >= mrows) break;
-    if (SPLIT) atomicAdd(ypart + (long)(m0 + mm) * N + n, acc[mm]);
+    if (SPLIT) ypart[(long)blockIdx.y * M * N + (long)(m0 + mm) * N + n] = acc[mm];   // см. выше
     else       y[(long)(m0 + mm) * N + n] = __float2half(acc[mm]);
   }
 }
 
-__global__ void w8a16_cast_kernel(const float* __restrict__ src, __half* __restrict__ dst, long n) {
+// [ЭПИЛОГ ОБНУЛЯЕТ ПЛОЩАДКУ САМ -- И ЭТО ДАРОМ]
+// Раньше площадка k-расщепления заводилась `torch::zeros` НА КАЖДЫЙ ВЫЗОВ, то есть отдельным
+// пуском обнуления. Замер ленты 16.08: `FillFunctor` -- 32272 пуска по 1.7 мкс = 56.5 мс = 1.41 %
+// шага декода, и это НАША трата. Расщепление при этом СНЯТЬ НЕЛЬЗЯ: без него ядро в 5 раз
+// медленнее (замерено: отношение к чужому 1.060 -> 0.207), потому что блоков выходит 5..17 на
+// 80 SM. Значит убирать надо обнуление, а не расщепление: площадка становится ПОСТОЯННОЙ, а
+// обнуляет её ЭТОТ эпилог, который те же элементы и так читает. Плата -- одна запись нуля на
+// элемент (70 КБ на вызов при N=17408, ~0.08 мкс) против 1.7 мкс отдельного пуска.
+__global__ void w8a16_cast_kernel(float* __restrict__ src, __half* __restrict__ dst, long n) {
   const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n) dst[i] = __float2half(src[i]);
+  if (i < n) { dst[i] = __float2half(src[i]); src[i] = 0.f; }
+}
+
+// [СВОД РАСЩЕПЛЕНИЙ В ФИКСИРОВАННОМ ПОРЯДКЕ] Заменяет atomicAdd в теле: каждое расщепление
+// пишет в свой слот, а здесь они складываются ВСЕГДА в одном порядке 0..ks-1. Ответ становится
+// побитово повторяемым от пуска к пуску. Обнуление не нужно -- слоты перезаписываются целиком.
+__global__ void w8a16_reduce_kernel(const float* __restrict__ src, __half* __restrict__ dst,
+                                    long n, int ks) {
+  const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  float a = 0.f;
+  for (int k = 0; k < ks; ++k) a += src[(long)k * n + i];
+  dst[i] = __float2half(a);
 }
 
 // Путь на ТЕНЗОРНЫХ ядрах для M>=8, где SIMT-путь проигрывает плотному cublas: там перелом
 // физический (15.7 TFLOPS против 93.6), и снять его можно только выйдя на HMMA.
 torch::Tensor w8a16_gemm_hmma(torch::Tensor x, torch::Tensor qweight, torch::Tensor qzeros,
-                              torch::Tensor scales, int64_t group_size) {
+                              torch::Tensor scales, int64_t group_size, bool v2_zero) {
+  const float zbias = v2_zero ? 0.0f : 1.0f;   // умолчания НЕТ намеренно -- см. w8a16_hmma.cuh
   TORCH_CHECK(x.is_cuda() && qweight.is_cuda(), "w8a16 hmma: CUDA");
   auto xc = x.contiguous(), qw = qweight.contiguous(), qz = qzeros.contiguous(), sc = scales.contiguous();
   const int N = (int)qw.size(1), K = (int)qw.size(0) * 4;
@@ -167,17 +366,50 @@ torch::Tensor w8a16_gemm_hmma(torch::Tensor x, torch::Tensor qweight, torch::Ten
   TORCH_CHECK(K % 128 == 0 && (N & 3) == 0, "w8a16 hmma: K кратно 128, N кратно 4");
   auto y = torch::empty({M, N}, torch::dtype(torch::kFloat16).device(xc.device()));
   constexpr int BN = 64, WN = 4, G = 128;
-  dim3 grid((N + BN - 1) / BN, (M + 15) / 16);
-  fa2_sm70::w8a16::w8a16_hmma<BN, WN, G><<<grid, WN * 32, 0, at::cuda::getCurrentCUDAStream()>>>(
-      reinterpret_cast<const __half*>(xc.data_ptr<at::Half>()), qw.data_ptr<int>(), qz.data_ptr<int>(),
-      reinterpret_cast<const __half*>(sc.data_ptr<at::Half>()),
-      reinterpret_cast<__half*>(y.data_ptr<at::Half>()), M, N, K);
+  const int nblk = (N + BN - 1) / BN, mblk = (M + 15) / 16;
+  const int ngroups = K / G;
+  // ЗАПОЛНЕНИЕ МАШИНЫ. Правило то же, что у gemv: целимся примерно в 8 блоков на SM (80 SM).
+  // Без этого на узкой форме (N=5120 -> nblk=80, mblk=1) сетка ровно 80 блоков, то есть один на SM.
+  static const bool ks_off = (getenv("FA2SM70_HMMA_KSPLIT") != nullptr
+                              && atoi(getenv("FA2SM70_HMMA_KSPLIT")) == 1);
+  int ksplit = ks_off ? 1 : max(1, min(ngroups, (80 * 8 + nblk * mblk - 1) / (nblk * mblk)));
+  const int gps = (ngroups + ksplit - 1) / ksplit;
+  ksplit = (ngroups + gps - 1) / gps;                    // обрезать пустые хвостовые куски
+  auto stream = at::cuda::getCurrentCUDAStream();
+  const auto* xp = reinterpret_cast<const __half*>(xc.data_ptr<at::Half>());
+  const auto* sp = reinterpret_cast<const __half*>(sc.data_ptr<at::Half>());
+  auto* yp = reinterpret_cast<__half*>(y.data_ptr<at::Half>());
+  if (ksplit <= 1) {
+    dim3 grid(nblk, mblk);
+    fa2_sm70::w8a16::w8a16_hmma<BN, WN, G, false><<<grid, WN * 32, 0, stream>>>(
+        xp, qw.data_ptr<int>(), qz.data_ptr<int>(), sp, yp, M, N, K, zbias);
+  } else {
+    // ПОСТОЯННАЯ ПЛОЩАДКА НА УСТРОЙСТВО, приходит НУЛЕВОЙ: первый раз её обнуляет `torch::zeros`,
+    // дальше -- эпилог предыдущего вызова (тот же приём, что у gemv: адрес стабилен, значит
+    // захват в CUDA-граф законен и ни одного пуска обнуления на вызов).
+    static std::unordered_map<int, torch::Tensor> кэш_hmma;
+    // Слот НА КАЖДОЕ расщепление -- см. пояснение у записи в w8a16_hmma.cuh.
+    const long need = (long)ksplit * M * N;
+    const int dev = (int)xc.device().index();
+    auto it = кэш_hmma.find(dev);
+    if (it == кэш_hmma.end() || it->second.numel() < need)
+      кэш_hmma[dev] = torch::zeros({max(need, (long)1 << 20)},
+                                   torch::dtype(torch::kFloat32).device(xc.device()));
+    float* pp = кэш_hmma[dev].data_ptr<float>();
+    dim3 grid(nblk, mblk, ksplit);
+    fa2_sm70::w8a16::w8a16_hmma<BN, WN, G, true><<<grid, WN * 32, 0, stream>>>(
+        xp, qw.data_ptr<int>(), qz.data_ptr<int>(), sp, nullptr, M, N, K, zbias, pp, gps);
+    w8a16_reduce_kernel<<<((long)M * N + 255) / 256, 256, 0, stream>>>(pp, yp, (long)M * N, ksplit);
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return y;
 }
 
 torch::Tensor w8a16_gemv(torch::Tensor x, torch::Tensor qweight, torch::Tensor qzeros,
-                         torch::Tensor scales, int64_t group_size) {
+                         torch::Tensor scales, int64_t group_size, bool v2_zero) {
+  // v2_zero=false -- слепок в формате `gptq` (v1, хранится z-1); true -- `gptq_v2`.
+  // Умолчания НЕТ намеренно: молчаливое умолчание здесь и есть тот дефект, что был.
+  const float zbias = v2_zero ? 0.0f : 1.0f;
   TORCH_CHECK(x.is_cuda() && qweight.is_cuda(), "w8a16: CUDA tensors required");
   TORCH_CHECK(qweight.dim() == 2 && scales.dim() == 2, "w8a16: qweight [K/4,N], scales [K/G,N]");
   auto xc = x.contiguous(), qw = qweight.contiguous(), qz = qzeros.contiguous(), sc = scales.contiguous();
@@ -192,29 +424,98 @@ torch::Tensor w8a16_gemv(torch::Tensor x, torch::Tensor qweight, torch::Tensor q
   const int ngroups = (K + G - 1) / G;
   // Fill the machine: aim for ~8 blocks per SM across 80 SMs. Below that the kernel is latency-bound
   // on a stream it should be bandwidth-bound on (measured: 20 blocks -> 48 GB/s of an achievable 841).
-  int ksplit = max(1, min(ngroups, (80 * 8 + nblk - 1) / nblk));
+  // [ЦЕНА РАСЩЕПЛЕНИЯ -- НЕ ТОЛЬКО АТОМАРНЫЕ] При ksplit>1 заводится площадка `torch::zeros`, а
+  // это ОТДЕЛЬНЫЙ пуск обнуления на КАЖДЫЙ вызов. Замер ленты 16.08: `FillFunctor` -- 32272 пуска
+  // по 1.7 мкс = 56.5 мс = 1.41 % шага декода, и это НАША трата, а не движка. Рычаг для замера:
+  // FA2SM70_W8_KSPLIT=1 запрещает расщепление совсем.
+  static const bool ks_off = (getenv("FA2SM70_W8_KSPLIT") != nullptr
+                              && atoi(getenv("FA2SM70_W8_KSPLIT")) == 1);
+  int ksplit = ks_off ? 1 : max(1, min(ngroups, (80 * 8 + nblk - 1) / nblk));
   const int gps = (ngroups + ksplit - 1) / ksplit;
   ksplit = (ngroups + gps - 1) / gps;                    // trim empty tail splits
   auto stream = at::cuda::getCurrentCUDAStream();
   const auto* xp = reinterpret_cast<const __half*>(xc.data_ptr<at::Half>());
   const auto* sp = reinterpret_cast<const __half*>(sc.data_ptr<at::Half>());
   auto* yp = reinterpret_cast<__half*>(y.data_ptr<at::Half>());
-  torch::Tensor part;
+  // ПОСТОЯННАЯ ПЛОЩАДКА НА УСТРОЙСТВО. Она приходит УЖЕ НУЛЕВОЙ: при первом заведении её обнуляет
+  // `torch::zeros`, дальше -- эпилог предыдущего вызова. Адрес стабилен, значит захват в CUDA-граф
+  // законен (свежая аллокация на каждый вызов тоже стабильна внутри графа, но тянет за собой пуск
+  // обнуления, ради снятия которого всё и делается).
+  static std::unordered_map<int, torch::Tensor> кэш;
   float* pp = nullptr;
   if (ksplit > 1) {
-    part = torch::zeros({M, N}, torch::dtype(torch::kFloat32).device(xc.device()));
-    pp = part.data_ptr<float>();
+    // Слот НА КАЖДОЕ расщепление (было: одна общая площадка под atomicAdd). Размер ограничен
+    // сверху самим правилом выбора ksplit ~ 640/nblk при nblk ~ N/256, то есть ksplit*N ~ 164k
+    // элементов на строку -- около 0.64 МиБ на строку M.
+    const long need = (long)ksplit * M * N;
+    const int dev = (int)xc.device().index();
+    auto it = кэш.find(dev);
+    if (it == кэш.end() || it->second.numel() < need) {
+      кэш[dev] = torch::zeros({max(need, (long)1 << 20)},
+                              torch::dtype(torch::kFloat32).device(xc.device()));
+    }
+    pp = кэш[dev].data_ptr<float>();
   }
   const dim3 grid = (ksplit > 1) ? dim3(nblk, ksplit) : dim3(nblk);
+  static const bool vec_off = (getenv("FA2SM70_W8_VEC") != nullptr
+                               && atoi(getenv("FA2SM70_W8_VEC")) == 0);
+  // [ВОРОТА БЫЛИ ШИРЕ, ЧЕМ НАДО, И ЭТО СТОИЛО СЛОВАРНОЙ ПРОЕКЦИИ]
+  // Требовалось N % (THREADS*4) == 0, то есть кратность 1024. У словаря N = 124160 -- кратно 4,
+  // но не 1024, и вся проекция падала на СКАЛЯРНЫЙ путь (LDG.32), ради снятия которого vec4 и
+  // писался. Достаточное условие -- РОВНО N % 4 == 0: `qzeros` пакует 4 столбца в слово, а
+  // краевой блок уже закрыт `live = (n0+3 < N)`, причём нежилая нить проходит ВСЕ барьеры
+  // (проверка стоит ПОСЛЕ них), поэтому расширение ворот не заводит расхождения в блоке.
+  const int nblk4 = (N + THREADS * 4 - 1) / (THREADS * 4);
+  const bool vec4 = !vec_off && (N % 4 == 0) && nblk4 > 0;
+  const dim3 grid4 = (ksplit > 1) ? dim3(nblk4, ksplit) : dim3(nblk4);
+  // Узкая ширина столбцов для MT>=4: вдвое меньше регистров -> вдвое больше варпов на SM.
+  // Сетка вдвое шире по N, чтение остаётся векторным (LDG.64).
+  const int nblk2 = (N + THREADS * 2 - 1) / (THREADS * 2);
+  const dim3 grid2 = (ksplit > 1) ? dim3(nblk2, ksplit) : dim3(nblk2);
+  static const int vw_force = getenv("FA2SM70_W8_VW") ? atoi(getenv("FA2SM70_W8_VW")) : 0;
 
+// [ВЫБОР ШИРИНЫ ОБРАЩЕНИЯ] vec4 читает вес одной LDG.128 вместо четырёх LDG.32 -- см. шапку
+// w8a16_gemv4_kernel. Применим, когда столбцов хватает на полную сетку по 4 на нить; иначе
+// краевой блок вышел бы за N, а обрезать его значило бы завести молчаливую ветвь на границе.
+// Откат: FA2SM70_W8_VEC=0 (нужен, чтобы A/B был возможен и после отгрузки).
 #define W8A16_LAUNCH(MT)                                                                     \
   do {                                                                                       \
-    if (ksplit > 1)                                                                          \
+    /* [ШИРИНА СТОЛБЦОВ ПРИ MT=4 -- ПО ФОРМЕ, А НЕ ОДНА НА ВСЕХ]                            \
+       Здесь стояло безусловное VW=2 при MT>=4 ("вдвое меньше регистров -> вдвое больше       \
+       варпов"). Замер 29.08 (чистая карта, M=4, мкс VW=2 / VW=4):                            \
+         qkv     5120x7168   101.7 /  74.9   -> VW=4 в 1.36                                   \
+         gdn_in  5120x8192   105.9 /  79.5   -> VW=4 в 1.33                                   \
+         down   17408x5120   241.8 / 157.7   -> VW=4 в 1.53  (КПД крыши 46 % -> 71 %)        \
+         out_proj 3072x5120   42.1 /  43.5   -> VW=2                                          \
+         gate+up 5120x17408  204.5 / 224.5   -> VW=2                                          \
+       Выигрыш там, где столбцов НЕ слишком много (N<=8192) и вход широк (K>=5120): там       \
+       занятость и так достаточна, и вдвое более широкое обращение окупается. Это ровно       \
+       зона M=k+1 спекулятивного декода, то есть боевой режим. При MT=8 VW=2 лучше везде.     \
+       Рычаг FA2SM70_W8_VW=2|4 перекрывает правило для A/B. */                                \
+    const bool _vw4_ok = (MT == 4) && (N <= 8192) && (K >= 5120);                             \
+    constexpr int VWD_UZ = (MT >= 4) ? 2 : 4;                                                 \
+    const int VWD = _vw4_ok ? 4 : VWD_UZ;                                                     \
+    const int VWX = vw_force ? vw_force : VWD;                                                \
+    if (vec4 && VWX == 2) {                                                                   \
+      if (ksplit > 1)                                                                         \
+        w8a16_gemv4_kernel<THREADS, MT, true, 2><<<grid2, THREADS, 0, stream>>>(              \
+            xp, qw.data_ptr<int>(), qz.data_ptr<int>(), sp, nullptr, pp, M, N, K, G, gps, m0, zbias); \
+      else                                                                                    \
+        w8a16_gemv4_kernel<THREADS, MT, false, 2><<<grid2, THREADS, 0, stream>>>(             \
+            xp, qw.data_ptr<int>(), qz.data_ptr<int>(), sp, yp, nullptr, M, N, K, G, 0, m0, zbias);  \
+    } else if (vec4) {                                                                        \
+      if (ksplit > 1)                                                                        \
+        w8a16_gemv4_kernel<THREADS, MT, true><<<grid4, THREADS, 0, stream>>>(                \
+            xp, qw.data_ptr<int>(), qz.data_ptr<int>(), sp, nullptr, pp, M, N, K, G, gps, m0, zbias); \
+      else                                                                                   \
+        w8a16_gemv4_kernel<THREADS, MT, false><<<grid4, THREADS, 0, stream>>>(               \
+            xp, qw.data_ptr<int>(), qz.data_ptr<int>(), sp, yp, nullptr, M, N, K, G, 0, m0, zbias);  \
+    } else if (ksplit > 1)                                                                   \
       w8a16_gemv_kernel<THREADS, MT, true><<<grid, THREADS, 0, stream>>>(                     \
-          xp, qw.data_ptr<int>(), qz.data_ptr<int>(), sp, nullptr, pp, M, N, K, G, gps, m0);  \
+          xp, qw.data_ptr<int>(), qz.data_ptr<int>(), sp, nullptr, pp, M, N, K, G, gps, m0, zbias);  \
     else                                                                                     \
       w8a16_gemv_kernel<THREADS, MT, false><<<grid, THREADS, 0, stream>>>(                    \
-          xp, qw.data_ptr<int>(), qz.data_ptr<int>(), sp, yp, nullptr, M, N, K, G, 0, m0);    \
+          xp, qw.data_ptr<int>(), qz.data_ptr<int>(), sp, yp, nullptr, M, N, K, G, 0, m0, zbias);    \
   } while (0)
 
   // Chunk M by the largest tile that fits. Each chunk costs one full pass over the weight, so the
@@ -231,7 +532,7 @@ torch::Tensor w8a16_gemv(torch::Tensor x, torch::Tensor qweight, torch::Tensor q
 #undef W8A16_LAUNCH
   if (ksplit > 1) {
     const long tot = (long)M * N;
-    w8a16_cast_kernel<<<(tot + 255) / 256, 256, 0, stream>>>(pp, yp, tot);
+    w8a16_reduce_kernel<<<(tot + 255) / 256, 256, 0, stream>>>(pp, yp, tot, ksplit);
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return y;
@@ -249,8 +550,231 @@ torch::Tensor w8a16_gemv(torch::Tensor x, torch::Tensor qweight, torch::Tensor q
 // means feeding the unpacked bytes to HMMA, which is a different (GEMM) kernel, not a tuning knob.
 bool w8a16_prefers_packed(int64_t M) { return M <= 4; }
 
+
+// ============================================================================================
+// ТЕЛО ПРИ МАЛОМ M (M в {1,2,4,8}) -- задача 197 / пункт 4 цели. Замер 10.09 на боевых формах:
+//
+//   тело           МиБ    пол чтения   это ядро (gemv)   новое ядро    КПД нового
+//   down_proj      42.5      57.6 мкс       95.4 (60%)      76.4        75%
+//   gate_up_proj   85.0     108.4          206.1 (53%)     129.3        84%
+//   in_proj_qkv    25.0      35.9           62.2 (58%)      49.7        72%
+//   out_proj       15.0      23.5           40.8 (58%)      35.5        66%
+//   ИТОГО по шагу (все тела, одна карта): пол 14.75 мс, это ядро 26.53, новое 19.28
+//   -> экономия 7.26 мс шага.
+//
+// ЧТО ИМЕННО ДАЛО ЧИСЛО (всё названо прибором ncu, не догадкой):
+//   Первая редакция шла на 67 % полосы (582 против 777 ГБ/с у чистого чтения той же раскладки)
+//   при ОДИНАКОВОЙ занятости 24 % -- её задаёт сетка, а не регистры. Счёт 37 %, конвейеры
+//   памяти 7 % -- не занято ничто. Прибор назвал настоящую цену: 133 команды на 16 байт веса,
+//   из них пайп ALU 53 %. То есть резерв был в ЧИСЛЕ КОМАНД, и он весь в накладных:
+//     1. 64-битное умножение в индексе QW4[(size_t)r*N4+n4] на КАЖДУЮ загрузку
+//        -> бегущий указатель pw += N4;
+//     2. перестановка активации (пары байтов в слове идут (b0,b2) и (b1,b3)) по 8 команд на
+//        строку слов -> делается ОДИН раз при укладке в разделяемую (PA/PB);
+//     3. распаковка байта через shift+and+cvt -> битовый трюк: (w & 0x00FF00FF) | 0x64006400
+//        даёт пару половинок 1024+b ОДНОЙ командой LOP3, вычитание 1024+z одной __hsub2;
+//     4. накопление __hfma2 -- одна команда на два умножения-сложения, сброс в fp32 на границе
+//        группы квантования;
+//     5. сведение по срезам СВОИМ ядром: torch .sum(0) стоил 27.6 мкс -- треть времени.
+//   Проверены и ОТВЕРГНУТЫ замером: развёртка чтений пачкой (U=2,4,8 -- ноль), два столбцовых
+//   отряда на поток (NG=2 -- хуже, 126 регистров против 79), занятость (сетка, а не регистры).
+//
+// ТОЧНОСТЬ. Накопитель half2 внутри группы даёт отн.ош 1.2e-3 против 2.9e-4 у gemv (оба против
+// эталона в fp64). Это ниже шума самого представления (int8-вес -- 4e-3 на элемент, fp16-
+// активация -- 6e-4), но рычаг FA2SM70_W8_M4_SUB=8 дробит группу на подблоки по 8 строк слов и
+// опускает ошибку вдвое ценой ~8 % времени -- на случай, если сквозной гейт качества потребует.
+template <int M, int THREADS>
+__global__ void w8a16_m4_kernel(const __half* __restrict__ X, const int* __restrict__ QW,
+                                const int* __restrict__ QZ, const __half* __restrict__ SC,
+                                float* __restrict__ ACC, int K, int N, int G,
+                                int групп_на_срез, float zbias, int subs) {
+  extern __shared__ __half2 sm_m4[];
+  const int групп = K / G;
+  const int g0 = blockIdx.y * групп_на_срез;
+  const int g1 = min(g0 + групп_на_срез, групп);
+  if (g0 >= g1) return;
+  const int k0 = g0 * G, k_len = (g1 - g0) * G, слов = k_len >> 2;
+  // PA[m][j] = (x[4j], x[4j+2]), PB[m][j] = (x[4j+1], x[4j+3]) -- перестановка сделана ЗДЕСЬ,
+  // один раз на блок, чтобы её не было в горячем цикле (пункт 2 разбора выше).
+  __half2* PA = sm_m4;
+  __half2* PB = PA + M * слов;
+  for (int i = threadIdx.x; i < M * слов; i += THREADS) {
+    const int m = i / слов, j = i - m * слов;
+    const __half2* src = reinterpret_cast<const __half2*>(&X[(size_t)m * K + k0 + (j << 2)]);
+    const __half2 a0 = src[0], a1 = src[1];
+    PA[i] = __lows2half2(a0, a1);
+    PB[i] = __highs2half2(a0, a1);
+  }
+  __syncthreads();
+
+  const int n0 = blockIdx.x * (THREADS * 4) + threadIdx.x * 4;
+  if (n0 >= N) return;
+  const int N4 = N >> 2;
+  const int слов_в_группе = G >> 2;
+
+  float acc[M][4];
+#pragma unroll
+  for (int m = 0; m < M; ++m)
+#pragma unroll
+    for (int c = 0; c < 4; ++c) acc[m][c] = 0.f;
+
+  const int4* __restrict__ pw = reinterpret_cast<const int4*>(QW)
+                              + (size_t)g0 * слов_в_группе * N4 + (n0 >> 2);
+  const __half* sc0 = SC + (size_t)g0 * N + n0;
+  const int* qz0 = QZ + (size_t)g0 * N4 + (n0 >> 2);
+
+  for (int g = g0; g < g1; ++g) {
+    float s[4];
+    __half2 сдвиг[4];
+    const unsigned zw = (unsigned)(*qz0);
+    qz0 += N4;
+#pragma unroll
+    for (int c = 0; c < 4; ++c) {
+      s[c] = __half2float(sc0[c]);
+      // 1024 -- экспонента битового трюка, (z + zbias) -- настоящий ноль группы из qzeros
+      сдвиг[c] = __float2half2_rn(1024.f + (float)((zw >> (8 * c)) & 0xFFu) + zbias);
+    }
+    sc0 += N;
+    const int j0 = (g - g0) * слов_в_группе;
+    for (int sb = 0; sb < слов_в_группе; sb += subs) {
+      const int кон = min(sb + subs, слов_в_группе);
+      __half2 ч[M][4];
+#pragma unroll
+      for (int m = 0; m < M; ++m)
+#pragma unroll
+        for (int c = 0; c < 4; ++c) ч[m][c] = __float2half2_rn(0.f);
+      for (int i = sb; i < кон; ++i) {
+        __half2 xa[M], xb[M];
+#pragma unroll
+        for (int m = 0; m < M; ++m) {
+          xa[m] = PA[m * слов + j0 + i];
+          xb[m] = PB[m * слов + j0 + i];
+        }
+        const int4 w4 = *pw;
+        pw += N4;
+        const int ws[4] = {w4.x, w4.y, w4.z, w4.w};
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+          const unsigned uu = (unsigned)ws[c];
+          unsigned пa = (uu & 0x00FF00FFu) | 0x64006400u;        // (1024+b0, 1024+b2)
+          unsigned пb = ((uu >> 8) & 0x00FF00FFu) | 0x64006400u; // (1024+b1, 1024+b3)
+          const __half2 wa = __hsub2(*reinterpret_cast<__half2*>(&пa), сдвиг[c]);
+          const __half2 wb = __hsub2(*reinterpret_cast<__half2*>(&пb), сдвиг[c]);
+#pragma unroll
+          for (int m = 0; m < M; ++m) {
+            ч[m][c] = __hfma2(xa[m], wa, ч[m][c]);
+            ч[m][c] = __hfma2(xb[m], wb, ч[m][c]);
+          }
+        }
+      }
+#pragma unroll
+      for (int m = 0; m < M; ++m)
+#pragma unroll
+        for (int c = 0; c < 4; ++c)
+          acc[m][c] += (__low2float(ч[m][c]) + __high2float(ч[m][c])) * s[c];
+    }
+  }
+#pragma unroll
+  for (int m = 0; m < M; ++m)
+#pragma unroll
+    for (int c = 0; c < 4; ++c)
+      ACC[((size_t)blockIdx.y * M + m) * N + n0 + c] = acc[m][c];
+}
+
+// сведение по срезам, развёрнуто по 4 (чтения идут пачкой)
+__global__ void w8a16_m4_reduce(const float* __restrict__ ACC, __half* __restrict__ OUT,
+                                int M, int N, int срезов) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= M * N) return;
+  const size_t шаг = (size_t)M * N;
+  const float* p = ACC + i;
+  float a = 0.f, b = 0.f, c = 0.f, d = 0.f;
+  int s = 0;
+  for (; s + 4 <= срезов; s += 4) {
+    a += p[0]; b += p[шаг]; c += p[2 * шаг]; d += p[3 * шаг];
+    p += 4 * шаг;
+  }
+  for (; s < срезов; ++s) { a += p[0]; p += шаг; }
+  OUT[i] = __float2half((a + b) + (c + d));
+}
+
+// Возвращает пустой тензор, если форма вне ворот -- вызывающий обязан проверить `defined()`
+// и упасть обратно на w8a16_gemv. ПРЕДУСЛОВИЕ ФОРМЫ ДЕГРАДИРУЕТ, А НЕ БРОСАЕТ (урок:
+// TORCH_CHECK в точке входа ядра однажды уронил боевой воркер на коротком запросе).
+torch::Tensor w8a16_m4(torch::Tensor x, torch::Tensor qweight, torch::Tensor qzeros,
+                       torch::Tensor scales, int64_t group_size, bool v2_zero) {
+  const float zbias = v2_zero ? 0.0f : 1.0f;
+  if (!(x.is_cuda() && qweight.is_cuda())) return torch::Tensor();
+  if (qweight.dim() != 2 || scales.dim() != 2 || qzeros.dim() != 2) return torch::Tensor();
+  auto xc = x.contiguous(), qw = qweight.contiguous(), qz = qzeros.contiguous(), sc = scales.contiguous();
+  const int N = (int)qw.size(1), K = (int)qw.size(0) * 4;
+  const int M = (int)(xc.numel() / xc.size(-1));
+  const int G = (int)group_size;
+  if (xc.size(-1) != K || (N & 3) != 0 || (K % G) != 0) return torch::Tensor();
+  if (!(M == 1 || M == 2 || M == 4 || M == 8)) return torch::Tensor();
+  const int групп = K / G;
+
+  // ПРАВИЛО ВЫБОРА ПО ЗАМЕРУ 10.09: целимся в ~256 блоков (3.2 на SM). Ниже этого ядро
+  // латентностное, выше -- растёт площадка сведения. Разброс внутри окна 230..680 блоков
+  // меньше 6 %, поэтому правило замкнутое, без автоподбора (автоподбор незаконен внутри
+  // захвата CUDA-графа).
+  static const int th_env = getenv("FA2SM70_W8_M4_TH") ? atoi(getenv("FA2SM70_W8_M4_TH")) : 0;
+  const int THREADS = (th_env == 64 || th_env == 128 || th_env == 256) ? th_env : 128;
+  const int блоков_n = (N + THREADS * 4 - 1) / (THREADS * 4);
+  static const int gps_env = getenv("FA2SM70_W8_M4_GPS") ? atoi(getenv("FA2SM70_W8_M4_GPS")) : 0;
+  int gps = gps_env > 0 ? gps_env
+                        : max(1, (int)lround((double)групп * блоков_n / 256.0));
+  gps = min(gps, групп);
+  const int срезов = (групп + gps - 1) / gps;
+  static const int subs_env = getenv("FA2SM70_W8_M4_SUB") ? atoi(getenv("FA2SM70_W8_M4_SUB")) : 0;
+  const int subs = subs_env > 0 ? min(subs_env, G >> 2) : (G >> 2);
+
+  const size_t шмем = (size_t)M * gps * G * sizeof(__half);
+  if (шмем > 47 * 1024) return torch::Tensor();
+
+  auto y = torch::empty({M, N}, torch::dtype(torch::kFloat16).device(xc.device()));
+  // ПОСТОЯННАЯ ПЛОЩАДКА НА УСТРОЙСТВО -- как у gemv выше: свежая аллокация на каждый вызов
+  // законна в графе, но тянет лишний пуск; здесь она ещё и не требует обнуления (каждый срез
+  // пишет свои строки целиком, а число срезов считается по ФАКТИЧЕСКОМУ покрытию групп --
+  // дефект «пустой срез не пишет, сведение читает мусор» поймана отн.ош 4.9e-01).
+  static std::unordered_map<int, torch::Tensor> кэш_m4;
+  const long need = (long)срезов * M * N;
+  const int dev = (int)xc.device().index();
+  auto it = кэш_m4.find(dev);
+  if (it == кэш_m4.end() || it->second.numel() < need) {
+    кэш_m4[dev] = torch::empty({max(need, (long)1 << 20)},
+                               torch::dtype(torch::kFloat32).device(xc.device()));
+  }
+  float* pp = кэш_m4[dev].data_ptr<float>();
+
+  auto stream = at::cuda::getCurrentCUDAStream();
+  const auto* xp = reinterpret_cast<const __half*>(xc.data_ptr<at::Half>());
+  const auto* sp = reinterpret_cast<const __half*>(sc.data_ptr<at::Half>());
+  auto* yp = reinterpret_cast<__half*>(y.data_ptr<at::Half>());
+  const dim3 grid(блоков_n, срезов);
+#define ПУСК_M4(MM, TT) w8a16_m4_kernel<MM, TT><<<grid, TT, шмем, stream>>>(                  \
+      xp, qw.data_ptr<int>(), qz.data_ptr<int>(), sp, pp, K, N, G, gps, zbias, subs)
+#define ПО_TH(MM) do {                                                                        \
+    if (THREADS == 64) ПУСК_M4(MM, 64); else if (THREADS == 256) ПУСК_M4(MM, 256);             \
+    else ПУСК_M4(MM, 128); } while (0)
+  if (M == 1) ПО_TH(1); else if (M == 2) ПО_TH(2);
+  else if (M == 4) ПО_TH(4); else ПО_TH(8);
+#undef ПО_TH
+#undef ПУСК_M4
+  w8a16_m4_reduce<<<((long)M * N + 255) / 256, 256, 0, stream>>>(pp, yp, M, N, срезов);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return y;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("w8a16_gemv", &w8a16_gemv, "fused GPTQ-int8 W8A16 GEMV (weights consumed packed, sm_70)");
-  m.def("w8a16_gemm_hmma", &w8a16_gemm_hmma, "W8A16 через тензорные ядра (M>=8)");
+  m.def("w8a16_gemv", &w8a16_gemv, "fused GPTQ-int8 W8A16 GEMV (weights consumed packed, sm_70)",
+        pybind11::arg("x"), pybind11::arg("qweight"), pybind11::arg("qzeros"),
+        pybind11::arg("scales"), pybind11::arg("group_size"), pybind11::arg("v2_zero"));
+  m.def("w8a16_gemm_hmma", &w8a16_gemm_hmma, "W8A16 через тензорные ядра (M>=8)",
+        pybind11::arg("x"), pybind11::arg("qweight"), pybind11::arg("qzeros"),
+        pybind11::arg("scales"), pybind11::arg("group_size"), pybind11::arg("v2_zero"));
+  m.def("w8a16_m4", &w8a16_m4, "W8A16 при малом M (M в {1,2,4,8}): КПД 66-84% полосы против 53-60% у gemv",
+        pybind11::arg("x"), pybind11::arg("qweight"), pybind11::arg("qzeros"),
+        pybind11::arg("scales"), pybind11::arg("group_size"), pybind11::arg("v2_zero"));
   m.def("w8a16_prefers_packed", &w8a16_prefers_packed, "measured crossover vs a dense fp16 GEMM");
 }

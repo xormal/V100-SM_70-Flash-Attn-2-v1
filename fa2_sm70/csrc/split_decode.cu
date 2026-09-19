@@ -11,6 +11,32 @@
 #ifndef FA2SM70_DEC_PF
 #define FA2SM70_DEC_PF 0
 #endif
+#ifndef FA2SM70_DEC_BLK
+// SM КАК МИКРОКОНТРОЛЛЕР, А НЕ КАК СЕТКА БЛОКОВ.
+// Обрыв "168 регистров = 3 блока/SM", об который расшибся конвейер (см. EV_decode_pipeline_pf_uu),
+// НЕ свойство машины: он следствие того, что мы сами нарезали SM на три тощих блока.
+// Тот же регистровый файл иначе: 3 x 128 x 168 = 64512 против 1 x 256 x 255 = 65280 -- сумма та же,
+// но контекст ОДИН, ему достаётся 255 регистров вместо 168 и вся разделяемая (96 КБ) вместо 24.
+// Плата -- 8 варпов вместо 12, то есть меньше АППАРАТНОГО сокрытия задержки; его заменяет явный
+// конвейер (роли варпов: подвозчики в скретчпад / счётчики).
+#define FA2SM70_DEC_BLK 128
+#endif
+#ifndef FA2SM70_DEC_SAH
+// ПЛОЩАДКА СВЕДЕНИЯ В half. Сейчас sA -- fp32, хотя ВЫШЕ fp16 у нас нигде ничего нет: чистая
+// инерция формата. Она же 99 % разделяемой блока (24576 из 24768 Б) и крупнейший байтовый хозяин
+// шага. СЦЕПЛЕНО С BLK: при BLK=256 версия fp32 даёт 49152 Б -- ровно потолок СТАТИЧЕСКОЙ
+// разделяемой на Volta, тело не собирается. То есть жирный блок ОБЯЗЫВАЕТ снять формат.
+#define FA2SM70_DEC_SAH 0
+#endif
+#ifndef FA2SM70_DEC_QW
+// ШИРОКОЕ ЧТЕНИЕ Q В ПРОЛОГЕ. Замерено в машинном коде боевого тела <EPT=8,GF=6>: пролог
+// содержит GF*EPT = 48 обращений LDG.E.U16, то есть восемь СМЕЖНЫХ half берутся ПОЭЛЕМЕНТНО.
+// Те же 96 байт укладываются в 6 обращений LDG.E.128 -- то же число БАЙТ при ВОСЬМИКРАТНО
+// меньшем числе СОБЫТИЙ перевозки (мера у нас -- событие, а не байт). Компилятор не
+// сворачивает сам: half* обещает выравнивание 2 байта, а load_bytes заявляет 16 явно.
+// Выключено по умолчанию: включение -- решение, иначе A/B бессмыслен.
+#define FA2SM70_DEC_QW 0
+#endif
 #ifndef FA2SM70_DEC_VK
 // Issue V together with K instead of in a later wave (the change that doubled outstanding loads per
 // warp). Default on; the switch exists so the A/B can be reproduced on a live server, where the
@@ -46,7 +72,8 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_fp16.h>
 #include <math_constants.h>
-static constexpr int BLK = 128, NW = BLK / 32;
+static constexpr int BLK = FA2SM70_DEC_BLK, NW = BLK / 32;
+#include "decode_hmma.cuh"
 
 // load this lane's EPT elements of key j as RAW floats (no per-token scale); KVB in {16,8,4}.
 // Vectorized: one 32/64-bit transaction per lane. The per-token scale is applied ONCE per key by
@@ -183,6 +210,18 @@ __device__ __forceinline__ void atomic_max_pos(float* addr, float v) {
 // [serving] OUR e4m3 KV store: quantise + write into the engine's (possibly strided) byte pool AND fold
 // the new tokens into the running ||k_raw|| bound IN THE SAME KERNEL. Doing the bound with torch ops cost
 // four extra kernels per layer per token; here it is free (the row is already in registers).
+// [ДЕРЕВО КАНДИДАТОВ, 06.09] МАСКА МОЖЕТ ВЫЧЕРКНУТЬ ВЕСЬ СРЕЗ РАСЩЕПЛЕНИЯ.
+// Онлайн-софтмакс копил exp(part - m). Пока маска была ПРЕФИКСНОЙ (цепь), длина
+// строки резала ровно там же, где маска, и вычеркнутый ключ в цикл не попадал.
+// У ДЕРЕВА маска дырявая: строка b0 читает ключи a0,a1 (они внутри её длины), но
+// НЕ видит их. Если срез расщепления начинается с таких ключей, то part=-inf И
+// m=-inf, и exp(-inf - (-inf)) = exp(NaN) = NaN -- Bsum и acc портятся навсегда, а
+// за ними весь слой. Замер: строки b выходили ЦЕЛИКОМ NaN (248320 из 248320
+// логитов) на первом же шаге дерева, строки a были чисты; с FA2SM70_TREE_NOMASK=1
+// (без маски) NaN исчезал и ответ был чист. Вычеркнутый ключ обязан давать РОВНО
+// ноль -- это и есть его вес в софтмаксе.
+#define FA2SM70_EXP_MASKED(p_, m_) (((p_) == -CUDART_INF_F) ? 0.f : __expf((p_) - (m_)))
+
 __global__ void reshape_and_cache_e4m3_kernel(
     const half* __restrict__ key, const half* __restrict__ value,
     uint8_t* __restrict__ kc, uint8_t* __restrict__ vc,
@@ -638,7 +677,7 @@ __global__ void split_decode_kernel(const half* __restrict__ Q, const void* __re
         for (int e = 0; e < EPT; ++e) acc[e] *= corr;
         #pragma unroll
         for (int u = 0; u < U; ++u) {                  // add the U new contributions relative to m
-            float p = __expf(part[u] - m);
+            float p = FA2SM70_EXP_MASKED(part[u], m);
             l += p; int jj = j + u * NW; float pv = sVb ? p * sVb[jj] : p; float vsl[EPT];
             load_raw<EPT, KVB>(V, kvbase + (long)jj * d + lane * EPT, vsl);
             #pragma unroll
@@ -657,7 +696,7 @@ __global__ void split_decode_kernel(const half* __restrict__ Q, const void* __re
         SMOD(part, j);                                  // softcap / ALiBi
         float m_old = m; if (part > m) { m = part; jmax = j; }
         float corr = (m_old == -CUDART_INF_F) ? 0.f : __expf(m_old - m);
-        float p = __expf(part - m);
+        float p = FA2SM70_EXP_MASKED(part, m);
         float pv = sVb ? p * sVb[j] : p; float vsl[EPT]; load_raw<EPT, KVB>(V, eoff, vsl);
         l = l * corr + p;
         #pragma unroll
@@ -869,11 +908,16 @@ __global__ void split_defer_kernel(const half* __restrict__ Q, const void* __res
                                    const float* __restrict__ sK, const float* __restrict__ sV, const float* __restrict__ Kmax,
                                    float* __restrict__ A, float* __restrict__ B, int H, int Hkv, int Sk, int d, float scale, int ns, int Lc, int kv_len,
                                    const int* __restrict__ block_table, int block_size, int max_blocks, const int* __restrict__ seqlens,
-                                   const int* __restrict__ kvstart) {
+                                   const int* __restrict__ kvstart,
+                                   // см. MQA-ядро: qGrp -- строк спекуляции на запрос; ядро само
+                                   // берёт запрос как b/qGrp. qGrp=1 -- прежнее поведение бит в бит.
+                                   int qGrp = 1, int qCausal = 1) {
     const int c = blockIdx.x, h = blockIdx.y, b = blockIdx.z;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int hkv = h / (H / Hkv);
-    const int b_len = seqlens ? seqlens[b] : kv_len;                 // per-sequence valid length (paged serving)
+    const int breq = (qGrp > 1) ? (b / qGrp) : b;
+    const int qpos = (qGrp > 1) ? (b - breq * qGrp) : 0;
+    const int b_len = seqlens ? (seqlens[breq] - (qCausal ? (qGrp - 1 - qpos) : 0)) : kv_len;                 // per-sequence valid length (paged serving)
     // Split the SEQUENCE, not the block table's CAPACITY. The host cannot size Lc from the live
     // length -- reading it needs a device sync, illegal while the decode graph is captured -- so it
     // passes capacity/ns, and at ctx=4K out of a 164K-token table only the first 2 of 64 splits had
@@ -885,7 +929,7 @@ __global__ void split_defer_kernel(const half* __restrict__ Q, const void* __res
     // ОДНИМ числом на последовательность: началом диапазона. Это точно ДО ТОКЕНА, в отличие от
     // подмены строки block_table (та умеет только кратное block_size и тащит лишние ключи), и оно же
     // снимает трафик: ядро читает W ключей вместо всей длины.
-    const int b_st = kvstart ? kvstart[b] : 0;
+    const int b_st = kvstart ? kvstart[breq] : 0;
     const int Lb = seqlens ? ((b_len - b_st + ns - 1) / ns) : Lc;
     const int k0 = b_st + c * Lb, k1 = min(k0 + Lb, b_len);
     const int oidx = ((b * H + h) * ns + c);
@@ -908,18 +952,22 @@ __global__ void split_defer_kernel(const half* __restrict__ Q, const void* __res
     const float* sKb = sK ? (PAGED ? sK : sK + (long)(b * Hkv + hkv) * Sk) : nullptr;
     const float* sVb = sV ? (PAGED ? sV : sV + (long)(b * Hkv + hkv) * Sk) : nullptr;
     float Bsum = 0.f;
-    constexpr int UU = 4; int j = k0 + warp;
+    // ГЛУБИНА НЕЗАВИСИМЫХ ЗАГРУЗОК. Замер §80c: ядро в 16 раз медленнее предела памяти и в
+    // 38 -- предела вычислений, то есть связывает ЛАТЕНТНОСТЬ, а не канал и не полоса.
+    // Глубина выведена под тот же макрос, что у соседнего тела, чтобы её можно было мерить.
+    constexpr int UU = FA2SM70_DEC_UU ? FA2SM70_DEC_UU : 4;
+    int j = k0 + warp;
     for (; j + (UU - 1) * NW < k1; j += UU * NW) {
         float part[UU];
         #pragma unroll
         for (int u = 0; u < UU; ++u) { int jj = j + u * NW; float ksl[EPT];
-            load_raw<EPT, KVB>(K, kvb_off<PAGED>(kvbase, jj, d, block_table, b, hkv, block_size, max_blocks, Hkv) + lane * EPT, ksl);
+            load_raw<EPT, KVB>(K, kvb_off<PAGED>(kvbase, jj, d, block_table, breq, hkv, block_size, max_blocks, Hkv) + lane * EPT, ksl);
             float pp = 0.f;
             #pragma unroll
             for (int e = 0; e < EPT; ++e) pp += qr[e] * ksl[e]; part[u] = pp; }
         #pragma unroll
         for (int u = 0; u < UU; ++u) { for (int o = 16; o > 0; o >>= 1) part[u] += __shfl_xor_sync(0xffffffffu, part[u], o);
-            if (sKb) part[u] *= sKb[s_off<PAGED>(j + u * NW, block_table, b, hkv, block_size, max_blocks, Hkv)]; }            // K per-token scale ONCE, after the reduce
+            if (sKb) part[u] *= sKb[s_off<PAGED>(j + u * NW, block_table, breq, hkv, block_size, max_blocks, Hkv)]; }            // K per-token scale ONCE, after the reduce
         { float mo = m;                                   // rescale ONCE per unrolled group, if the max grew
             #pragma unroll
             for (int u = 0; u < UU; ++u) m = fmaxf(m, part[u]);
@@ -929,28 +977,28 @@ __global__ void split_defer_kernel(const half* __restrict__ Q, const void* __res
                 for (int e = 0; e < EPT; ++e) acc[e] *= corr; } }
         #pragma unroll
         for (int u = 0; u < UU; ++u) {
-            float p = __expf(part[u] - m); Bsum += p; int jj = j + u * NW;
-            float pv = sVb ? p * sVb[s_off<PAGED>(jj, block_table, b, hkv, block_size, max_blocks, Hkv)] : p; float vsl[EPT]; // V per-token scale folded into p (once)
-            load_raw<EPT, KVB>(V, kvb_off<PAGED>(kvbase, jj, d, block_table, b, hkv, block_size, max_blocks, Hkv) + lane * EPT, vsl);
+            float p = FA2SM70_EXP_MASKED(part[u], m); Bsum += p; int jj = j + u * NW;
+            float pv = sVb ? p * sVb[s_off<PAGED>(jj, block_table, breq, hkv, block_size, max_blocks, Hkv)] : p; float vsl[EPT]; // V per-token scale folded into p (once)
+            load_raw<EPT, KVB>(V, kvb_off<PAGED>(kvbase, jj, d, block_table, breq, hkv, block_size, max_blocks, Hkv) + lane * EPT, vsl);
             #pragma unroll
             for (int e = 0; e < EPT; ++e) acc[e] += pv * vsl[e]; }
     }
     for (; j < k1; j += NW) {
-        const long eoff = kvb_off<PAGED>(kvbase, j, d, block_table, b, hkv, block_size, max_blocks, Hkv) + lane * EPT; float ksl[EPT];
+        const long eoff = kvb_off<PAGED>(kvbase, j, d, block_table, breq, hkv, block_size, max_blocks, Hkv) + lane * EPT; float ksl[EPT];
         load_raw<EPT, KVB>(K, eoff, ksl);
         float part = 0.f;
         #pragma unroll
         for (int e = 0; e < EPT; ++e) part += qr[e] * ksl[e];
         #pragma unroll
         for (int o = 16; o > 0; o >>= 1) part += __shfl_xor_sync(0xffffffffu, part, o);
-        if (sKb) part *= sKb[s_off<PAGED>(j, block_table, b, hkv, block_size, max_blocks, Hkv)];
+        if (sKb) part *= sKb[s_off<PAGED>(j, block_table, breq, hkv, block_size, max_blocks, Hkv)];
         { const float mo = m; m = fmaxf(m, part);
           if (m > mo) { const float corr = (mo == -CUDART_INF_F) ? 0.f : __expf(mo - m);
               Bsum *= corr;
               #pragma unroll
               for (int e = 0; e < EPT; ++e) acc[e] *= corr; } }
-        float p = __expf(part - m); Bsum += p;
-        float pv = sVb ? p * sVb[s_off<PAGED>(j, block_table, b, hkv, block_size, max_blocks, Hkv)] : p; float vsl[EPT];
+        float p = FA2SM70_EXP_MASKED(part, m); Bsum += p;
+        float pv = sVb ? p * sVb[s_off<PAGED>(j, block_table, breq, hkv, block_size, max_blocks, Hkv)] : p; float vsl[EPT];
         load_raw<EPT, KVB>(V, eoff, vsl);
         #pragma unroll
         for (int e = 0; e < EPT; ++e) acc[e] += pv * vsl[e];
@@ -1078,13 +1126,33 @@ __global__ void split_defer_mqa_kernel(const half* __restrict__ Q, const void* _
                                        const float* __restrict__ sK, const float* __restrict__ sV, const float* __restrict__ Kmax,
                                        float* __restrict__ A, float* __restrict__ B, int H, int Hkv, int Sk, int d, float scale, int ns, int Lc, int kv_len,
                                        const int* __restrict__ block_table, int block_size, int max_blocks, const int* __restrict__ seqlens,
-                                       const int* __restrict__ kvstart) {
+                                       const int* __restrict__ kvstart,
+                                       // [МАСКА ХВОСТА -- ДЕРЕВО КАНДИДАТОВ] Ключи до `ctxlen[b]` видит КАЖДАЯ строка
+                                       // (общий контекст). Ключи текущего шага -- только те, чей бит стоит в
+                                       // `tailmask[b]`. Причинность ЦЕПИ выражалась одним числом (длиной префикса),
+                                       // но у ДЕРЕВА брат лежит МЕЖДУ предками и самим узлом, и одним интервалом это
+                                       // не выражается. Оба указателя нулевые = прежнее поведение до бита.
+                                       const int* __restrict__ ctxlen = nullptr,
+                                       const unsigned* __restrict__ tailmask = nullptr,
+                                       // [РАЗРЕЖЕННЫЙ ОБХОД -- шаг 2] Без индекса путь БАЙТ В БАЙТ прежний.
+                                       const int* __restrict__ selIdx = nullptr,
+                                       const int* __restrict__ selCnt = nullptr,
+                                       int selStride = 0, int selBlkLog = 7,
+                                       // [ВИРТУАЛЬНЫЙ БАТЧ БЕЗ КОПИЙ] qGrp = строк спекуляции на ЗАПРОС.
+                                       // Раньше хозяин РАСКЛАДЫВАЛ таблицу блоков и длины на каждую строку
+                                       // (две копии + два запуска на шаг). Но строка r запроса p -- это
+                                       // p = r / qGrp, а её длина -- sl[p] - (qGrp-1 - r%qGrp) при причинности.
+                                       // Ядро считает это само; копии исчезают вместе с запусками.
+                                       // qGrp = 1 -- прежнее поведение БИТ В БИТ.
+                                       int qGrp = 1, int qCausal = 1) {
     // VEQK: values ARE the keys (Gemma-4 global layers, attention_k_eq_v -> no v_proj). We hold the
     // already-loaded K in registers and reuse it as V, halving the HBM read traffic on those layers.
     const int c = blockIdx.x, hg = blockIdx.y, b = blockIdx.z;   // hg: query-head GROUP (GF heads)
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int h0 = hg * GF, hkv = h0 / (H / Hkv);                // GF heads h0..h0+GF-1 share this KV head
-    const int b_len = seqlens ? seqlens[b] : kv_len;                 // per-sequence valid length (paged serving)
+    const int breq = (qGrp > 1) ? (b / qGrp) : b;                    // ЗАПРОС строки b
+    const int qpos = (qGrp > 1) ? (b - breq * qGrp) : 0;             // позиция внутри спекуляции
+    const int b_len = seqlens ? (seqlens[breq] - (qCausal ? (qGrp - 1 - qpos) : 0)) : kv_len;
     // Split the SEQUENCE, not the block table's CAPACITY. The host cannot size Lc from the live
     // length -- reading it needs a device sync, illegal while the decode graph is captured -- so it
     // passes capacity/ns, and at ctx=4K out of a 164K-token table only the first 2 of 64 splits had
@@ -1093,16 +1161,47 @@ __global__ void split_defer_mqa_kernel(const half* __restrict__ Q, const void* _
     // from it: the grid stays static (CUDA-graph safe), only each CTA's range moves.
     // [ОКНО] см. split_defer_kernel: левая граница на последовательность -- это всё, чем скользящий
     // слой отличается от полного, и она точна ДО ТОКЕНА.
-    const int b_st = kvstart ? kvstart[b] : 0;
+    const int b_st = kvstart ? kvstart[breq] : 0;
+    const int ctxb = tailmask ? ctxlen[b] : 0x7fffffff;      // граница «общий контекст | хвост шага»
+    const unsigned tmb = tailmask ? tailmask[b] : 0u;
     const int Lb = seqlens ? ((b_len - b_st + ns - 1) / ns) : Lc;
-    const int k0 = b_st + c * Lb, k1 = min(k0 + Lb, b_len);
-    __shared__ float sB[NW * GF], sA[NW * 32 * EPT * GF], sM[NW * GF];
+    const int _k0d = b_st + c * Lb, _k1d = min(_k0d + Lb, b_len);
+    // [СРЕЗ СПИСКА] Расщепление берёт срез СПИСКА ОТОБРАННЫХ БЛОКОВ по ЧИСЛУ, а не по диапазону
+    // позиций: иначе часть расщеплений получила бы пустой срез, а часть -- всю работу.
+    const int* _sI = nullptr; int _b0 = 0, _b1 = 1;
+    if (selIdx != nullptr) {
+        const long _o = (long)(b * Hkv + hkv);
+        _sI = selIdx + _o * (long)selStride;
+        const int _cnt = selCnt[_o];
+        const int _per = (_cnt + ns - 1) / ns;
+        _b0 = min(c * _per, _cnt); _b1 = min(_b0 + _per, _cnt);
+    }
+#if FA2SM70_DEC_SAH
+    using SAcc = half;                       // выше fp16 у нас нигде ничего нет
+#define SA_PUT(x) __float2half(x)
+#define SA_GET(x) __half2float(x)
+                       // выше fp16 у нас нигде ничего нет
+#else
+    using SAcc = float;
+#define SA_PUT(x) (x)
+#define SA_GET(x) (x)
+#endif
+    __shared__ float sB[NW * GF], sM[NW * GF];
+    __shared__ SAcc  sA[NW * 32 * EPT * GF];
     float qr[GF][EPT], acc[GF][EPT], m[GF], Bsum[GF];
     #pragma unroll
     for (int g = 0; g < GF; ++g) {
         const half* Qb = Q + (long)(b * H + h0 + g) * d;
+#if FA2SM70_DEC_QW
+        half hb[EPT];                                    // 8 half = 16 B = ОДНО LDG.E.128
+        load_bytes<EPT * 2>(reinterpret_cast<const uint8_t*>(Qb + lane * EPT),
+                            reinterpret_cast<uint8_t*>(hb));
+        #pragma unroll
+        for (int e = 0; e < EPT; ++e) { qr[g][e] = scale * __half2float(hb[e]); acc[g][e] = 0.f; }
+#else
         #pragma unroll
         for (int e = 0; e < EPT; ++e) { qr[g][e] = scale * __half2float(Qb[lane * EPT + e]); acc[g][e] = 0.f; }
+#endif
         // [ONLINE MAX] see split_defer_kernel: the external certified bound is gone, each of the GF heads
         // carries its own running max taken from its own scores.
         m[g] = -CUDART_INF_F; Bsum[g] = 0.f;
@@ -1118,6 +1217,13 @@ __global__ void split_defer_mqa_kernel(const half* __restrict__ Q, const void* _
     // shipping it REGRESSED a real d=256 model by 10% at 128K on the server, which is exactly the
     // divergence a microbenchmark cannot show. Hold UU*EPT roughly constant instead.
     constexpr int UU = FA2SM70_DEC_UU ? FA2SM70_DEC_UU : (EPT <= 4 ? 4 : 2);
+    // ВНЕШНИЙ ЦИКЛ ПО ОТОБРАННЫМ БЛОКАМ. При плотном пути -- РОВНО ОДНА итерация с прежними
+    // границами. Накопители (m, Bsum, acc) объявлены ВЫШЕ и переживают смену блока: это тот же
+    // онлайн-софтмакс, просто диапазон ключей теперь рваный. Предвыборка перезаряжается на
+    // каждом блоке -- иначе она подтянула бы ключи ЗА его границей, то есть чужие.
+    for (int _bi = _b0; _bi < _b1; ++_bi) {
+    const int k0 = (_sI != nullptr) ? max(b_st, (int)((long)_sI[_bi] << selBlkLog)) : _k0d;
+    const int k1 = (_sI != nullptr) ? min((int)(((long)_sI[_bi] + 1) << selBlkLog), b_len) : _k1d;
     int j = k0 + warp;
 #if FA2SM70_DEC_PF
     // [MLP, шаг 2] Cross-iteration prefetch: issue the NEXT group's K/V before consuming this one, so
@@ -1128,7 +1234,7 @@ __global__ void split_defer_mqa_kernel(const half* __restrict__ Q, const void* _
     if (j + (UU - 1) * NW < k1) {
 #pragma unroll
         for (int u = 0; u < UU; ++u) {
-            const long eo = kvb_off<PAGED>(kvbase, j + u * NW, d, block_table, b, hkv, block_size, max_blocks, Hkv) + lane * EPT;
+            const long eo = kvb_off<PAGED>(kvbase, j + u * NW, d, block_table, breq, hkv, block_size, max_blocks, Hkv) + lane * EPT;
             load_raw<EPT, KVB>(K, eo, kpf[u]);
             if constexpr (!VEQK) load_raw<EPT, KVB>(V, eo, vpf[u]);
         }
@@ -1159,13 +1265,13 @@ __global__ void split_defer_mqa_kernel(const half* __restrict__ Q, const void* _
         if (jn + (UU - 1) * NW < k1) {
 #pragma unroll
             for (int u = 0; u < UU; ++u) {
-                const long eo = kvb_off<PAGED>(kvbase, jn + u * NW, d, block_table, b, hkv, block_size, max_blocks, Hkv) + lane * EPT;
+                const long eo = kvb_off<PAGED>(kvbase, jn + u * NW, d, block_table, breq, hkv, block_size, max_blocks, Hkv) + lane * EPT;
                 load_raw<EPT, KVB>(K, eo, kpf[u]);                            // in flight across the whole body
                 if constexpr (!VEQK) load_raw<EPT, KVB>(V, eo, vpf[u]); } }
 #else
 #pragma unroll
         for (int u = 0; u < UU; ++u) { int jj = j + u * NW;
-            const long eo = kvb_off<PAGED>(kvbase, jj, d, block_table, b, hkv, block_size, max_blocks, Hkv) + lane * EPT;
+            const long eo = kvb_off<PAGED>(kvbase, jj, d, block_table, breq, hkv, block_size, max_blocks, Hkv) + lane * EPT;
             load_raw<EPT, KVB>(K, eo, kcur[u]);                               // ONE K load -> GF dots
             if constexpr (!VEQK) {
 #if FA2SM70_DEC_VK
@@ -1186,7 +1292,13 @@ __global__ void split_defer_mqa_kernel(const half* __restrict__ Q, const void* _
         for (int g = 0; g < GF; ++g)
             #pragma unroll
             for (int u = 0; u < UU; ++u) { for (int o = 16; o > 0; o >>= 1) part[g][u] += __shfl_xor_sync(0xffffffffu, part[g][u], o);
-                if (sKb) part[g][u] *= sKb[s_off<PAGED>(j + u * NW, block_table, b, hkv, block_size, max_blocks, Hkv)]; }
+                if (sKb) part[g][u] *= sKb[s_off<PAGED>(j + u * NW, block_table, breq, hkv, block_size, max_blocks, Hkv)]; }
+        if (tailmask) {                                   // ХВОСТ: ключ вне маски строки не участвует
+            #pragma unroll
+            for (int u = 0; u < UU; ++u) { const int t_ = (j + u * NW) - ctxb;
+                if (t_ >= 0 && (t_ >= 32 || !((tmb >> t_) & 1u))) {
+                    #pragma unroll
+                    for (int g = 0; g < GF; ++g) part[g][u] = -CUDART_INF_F; } } }
         #pragma unroll
         for (int g = 0; g < GF; ++g) { float mo = m[g];       // rescale ONCE per unrolled group, if the max grew
             #pragma unroll
@@ -1205,18 +1317,18 @@ __global__ void split_defer_mqa_kernel(const half* __restrict__ Q, const void* _
                 #pragma unroll
                 for (int e = 0; e < EPT; ++e) vsl[e] = vhold[u][e];           // issued back with K, above
 #else
-                load_raw<EPT, KVB>(V, kvb_off<PAGED>(kvbase, jj, d, block_table, b, hkv, block_size, max_blocks, Hkv) + lane * EPT, vsl);
+                load_raw<EPT, KVB>(V, kvb_off<PAGED>(kvbase, jj, d, block_table, breq, hkv, block_size, max_blocks, Hkv) + lane * EPT, vsl);
 #endif
             }
-            float vs = sVb ? sVb[s_off<PAGED>(jj, block_table, b, hkv, block_size, max_blocks, Hkv)] : 1.f;
+            float vs = sVb ? sVb[s_off<PAGED>(jj, block_table, breq, hkv, block_size, max_blocks, Hkv)] : 1.f;
             #pragma unroll
-            for (int g = 0; g < GF; ++g) { float p = __expf(part[g][u] - m[g]); Bsum[g] += p;
+            for (int g = 0; g < GF; ++g) { float p = FA2SM70_EXP_MASKED(part[g][u], m[g]); Bsum[g] += p;
                 float pv = sVb ? p * vs : p;
                 #pragma unroll
                 for (int e = 0; e < EPT; ++e) acc[g][e] += pv * vsl[e]; } }
     }
     for (; j < k1; j += NW) {
-        const long eoff = kvb_off<PAGED>(kvbase, j, d, block_table, b, hkv, block_size, max_blocks, Hkv) + lane * EPT; float ksl[EPT];
+        const long eoff = kvb_off<PAGED>(kvbase, j, d, block_table, breq, hkv, block_size, max_blocks, Hkv) + lane * EPT; float ksl[EPT];
         load_raw<EPT, KVB>(K, eoff, ksl);
         float part[GF];
         #pragma unroll
@@ -1225,13 +1337,17 @@ __global__ void split_defer_mqa_kernel(const half* __restrict__ Q, const void* _
             for (int e = 0; e < EPT; ++e) pp += qr[g][e] * ksl[e]; part[g] = pp; }
         #pragma unroll
         for (int g = 0; g < GF; ++g) { for (int o = 16; o > 0; o >>= 1) part[g] += __shfl_xor_sync(0xffffffffu, part[g], o);
-            if (sKb) part[g] *= sKb[s_off<PAGED>(j, block_table, b, hkv, block_size, max_blocks, Hkv)]; }
+            if (sKb) part[g] *= sKb[s_off<PAGED>(j, block_table, breq, hkv, block_size, max_blocks, Hkv)]; }
         float vsl[EPT];
         if constexpr (VEQK) {
             #pragma unroll
             for (int e = 0; e < EPT; ++e) vsl[e] = ksl[e]; }                  // V == K: reuse the loaded key
         else load_raw<EPT, KVB>(V, eoff, vsl);
-        float vs = sVb ? sVb[s_off<PAGED>(j, block_table, b, hkv, block_size, max_blocks, Hkv)] : 1.f;
+        if (tailmask) { const int t_ = j - ctxb;                                  // ХВОСТ, остаточный цикл
+            if (t_ >= 0 && (t_ >= 32 || !((tmb >> t_) & 1u))) {
+                #pragma unroll
+                for (int g = 0; g < GF; ++g) part[g] = -CUDART_INF_F; } }
+        float vs = sVb ? sVb[s_off<PAGED>(j, block_table, breq, hkv, block_size, max_blocks, Hkv)] : 1.f;
         #pragma unroll
         for (int g = 0; g < GF; ++g) { const float mo = m[g]; m[g] = fmaxf(m[g], part[g]);
             if (m[g] > mo) { const float corr = (mo == -CUDART_INF_F) ? 0.f : __expf(mo - m[g]);
@@ -1239,16 +1355,18 @@ __global__ void split_defer_mqa_kernel(const half* __restrict__ Q, const void* _
                 #pragma unroll
                 for (int e = 0; e < EPT; ++e) acc[g][e] *= corr; } }
         #pragma unroll
-        for (int g = 0; g < GF; ++g) { float p = __expf(part[g] - m[g]); Bsum[g] += p;
+        for (int g = 0; g < GF; ++g) { float p = FA2SM70_EXP_MASKED(part[g], m[g]); Bsum[g] += p;
             float pv = sVb ? p * vs : p;
             #pragma unroll
             for (int e = 0; e < EPT; ++e) acc[g][e] += pv * vsl[e]; }
     }
+    }   // конец внешнего цикла по отобранным блокам
     #pragma unroll
     for (int g = 0; g < GF; ++g) {
         if (lane == 0) { sB[warp * GF + g] = Bsum[g]; sM[warp * GF + g] = m[g]; }
         #pragma unroll
-        for (int e = 0; e < EPT; ++e) sA[(warp * GF + g) * 32 * EPT + lane * EPT + e] = acc[g][e];
+        for (int e = 0; e < EPT; ++e)
+            sA[(warp * GF + g) * 32 * EPT + lane * EPT + e] = SA_PUT(acc[g][e]);
     }
     __syncthreads();
     if (warp == 0) {
@@ -1267,7 +1385,8 @@ __global__ void split_defer_mqa_kernel(const half* __restrict__ Q, const void* _
             for (int w = 0; w < NW; ++w) { const float cw = (sM[w * GF + g] == -CUDART_INF_F) ? 0.f : __expf(sM[w * GF + g] - gm);
                 gB += cw * sB[w * GF + g];
                 #pragma unroll
-                for (int e = 0; e < EPT; ++e) gA[e] += cw * sA[(w * GF + g) * 32 * EPT + lane * EPT + e]; }
+                for (int e = 0; e < EPT; ++e)
+                    gA[e] += cw * SA_GET(sA[(w * GF + g) * 32 * EPT + lane * EPT + e]); }
             #pragma unroll
             for (int e = 0; e < EPT; ++e) A[(long)oidx * d + lane * EPT + e] = gA[e];
             if (lane == 0) { B[oidx] = gB; B[(long)gridDim.z * H * ns + oidx] = gm; }
@@ -1512,7 +1631,39 @@ void flash_decode_defer_mqa_paged_into(
     // то есть ровно прежнее поведение -- ни один существующий вызов не меняет смысла. Тем же
     // std::optional, что и таблицы масштабов, и по той же причине: None не приводится к
     // torch::Tensor, а значит значение по умолчанию torch::Tensor() сломало бы старые вызовы.
-    std::optional<torch::Tensor> kv_start_opt) {
+    std::optional<torch::Tensor> kv_start_opt,
+    // [ДЕРЕВО] Граница «общий контекст | хвост шага» на строку (int32 [B]) и битовая маска хвоста
+    // (uint32 [B]). Обе отсутствуют = прежнее поведение до бита: цепь выражается длиной префикса.
+    std::optional<torch::Tensor> ctxlen_opt, std::optional<torch::Tensor> tailmask_opt,
+    // [РАЗРЕЖЕННЫЙ ОБХОД -- шаг 2] Индекс отобранных блоков ключей на (строку, KV-голову).
+    // Отсутствует = плотный путь, БАЙТ В БАЙТ прежний (проверено побайтовой сверкой выхода).
+    std::optional<torch::Tensor> selCnt_opt, std::optional<torch::Tensor> selIdx_opt,
+    int64_t selBlk = 128,
+    // [ВИРТУАЛЬНЫЙ БАТЧ БЕЗ КОПИЙ] qGrp -- строк спекуляции на ЗАПРОС. Таблицу блоков и длины
+    // подаём ИСХОДНЫЕ (на запрос), ядро само берёт p = r/qGrp и длину sl[p]-(qGrp-1-r%qGrp).
+    // Раньше хозяин раскладывал их копиями: два запуска и две копии на шаг. qGrp=1 -- прежнее
+    // поведение бит в бит. qCausal=0 -- двунаправленный блок черновика (длина у всех строк одна).
+    int64_t qGrp = 1, int64_t qCausal = 1) {
+    TORCH_CHECK(qGrp >= 1, "qGrp >= 1");
+    const torch::Tensor selCnt_t = selCnt_opt.has_value() ? *selCnt_opt : torch::Tensor();
+    const torch::Tensor selIdx_t = selIdx_opt.has_value() ? *selIdx_opt : torch::Tensor();
+    const int* sCp = nullptr; const int* sIp = nullptr; int sStr = 0, sBlg = 7;
+    if (selIdx_t.defined()) {
+        TORCH_CHECK(selCnt_t.defined(), "индекс отбора требует счётчиков");
+        TORCH_CHECK(selIdx_t.scalar_type() == torch::kInt32 && selCnt_t.scalar_type() == torch::kInt32
+                    && selIdx_t.is_contiguous() && selCnt_t.is_contiguous(),
+                    "индекс отбора: int32 плотные");
+        TORCH_CHECK((selBlk & (selBlk - 1)) == 0, "блок отбора -- степень двойки: ", selBlk);
+        sBlg = 0; while ((1LL << sBlg) < selBlk) ++sBlg;   // ядро СДВИГАЕТ, а не делит
+        sIp = selIdx_t.data_ptr<int32_t>(); sCp = selCnt_t.data_ptr<int32_t>();
+        sStr = (int)selIdx_t.size(-1);
+    }
+    const torch::Tensor ctxlen_t = ctxlen_opt.has_value() ? *ctxlen_opt : torch::Tensor();
+    const torch::Tensor tailmask_t = tailmask_opt.has_value() ? *tailmask_opt : torch::Tensor();
+    const int* ctp = ctxlen_t.defined() ? ctxlen_t.data_ptr<int32_t>() : nullptr;
+    const unsigned* tmp_ = tailmask_t.defined()
+        ? reinterpret_cast<const unsigned*>(tailmask_t.data_ptr<int32_t>()) : nullptr;
+    TORCH_CHECK(!tailmask_t.defined() || ctxlen_t.defined(), "маска хвоста требует ctxlen");
     const torch::Tensor sK = sK_opt.has_value() ? *sK_opt : torch::Tensor();
     const torch::Tensor sV = sV_opt.has_value() ? *sV_opt : torch::Tensor();
     const torch::Tensor kv_start = kv_start_opt.has_value() ? *kv_start_opt : torch::Tensor();
@@ -1543,6 +1694,14 @@ void flash_decode_defer_mqa_paged_into(
     }
     if (fp8) { TORCH_CHECK(Kcache.element_size() == 1, "fp8 paged: 1-byte KV pool"); scale *= k_scale; }
     int mb = block_table.size(1), valid = (int)kv_len;
+    // [ВИРТУАЛЬНЫЙ БАТЧ БЕЗ КОПИЙ] Предусловия формы: при qGrp>1 строк ВТРОЕ/ВЧЕТВЕРО больше,
+    // чем записей в таблице и длинах. Несоответствие обязано быть ОТКАЗОМ, а не выходом за
+    // границу: тихая порча тут выглядит как «незаконный доступ» глубоко в воркере.
+    TORCH_CHECK((long)block_table.size(0) * qGrp >= (long)Bb,
+                "qGrp=", qGrp, ": строк ", Bb, ", а таблица блоков на ", block_table.size(0),
+                " запросов -- не хватает");
+    TORCH_CHECK(seqlens.numel() == 0 || (long)seqlens.numel() * qGrp >= (long)Bb,
+                "qGrp=", qGrp, ": строк ", Bb, ", а длин ", seqlens.numel(), " -- не хватает");
     int64_t blk = Kcache.stride(0) / d;
     bool veqk = (Kcache.data_ptr() == Vcache.data_ptr() && Kcache.sizes() == Vcache.sizes());
     int ns = std::max<int>(1, std::min<int>(num_splits, (valid + 31) / 32));
@@ -1556,7 +1715,8 @@ void flash_decode_defer_mqa_paged_into(
     const int* stp = nullptr;
     if (kv_start.defined() && kv_start.numel() > 0) {
         TORCH_CHECK(kv_start.scalar_type() == torch::kInt32 && kv_start.is_contiguous()
-                    && kv_start.numel() >= Bb, "kv_start: int32 contiguous [B]");
+                    && (long)kv_start.numel() * qGrp >= (long)Bb,
+                    "kv_start: int32 contiguous [B/qGrp]");
         TORCH_CHECK(slp != nullptr, "kv_start requires per-sequence seqlens");
         stp = kv_start.data_ptr<int32_t>();
     }
@@ -1573,10 +1733,11 @@ void flash_decode_defer_mqa_paged_into(
 #define RUNK(EPT, KVB, GFV, VQ)                                                                       \
     do { if (GF <= 1) split_defer_kernel<EPT,KVB,true><<<g1s,BLK,0,st>>>(                             \
              q,kp,vp,skp,svp,km,ap,bp,H,Hkv,(int)blk,d,(float)scale,ns,Lc,valid,                      \
-             block_table.data_ptr<int32_t>(),(int)block_size,mb,slp,stp);                             \
+             block_table.data_ptr<int32_t>(),(int)block_size,mb,slp,stp,(int)qGrp,(int)qCausal);   \
          else split_defer_mqa_kernel<EPT,KVB,GFV,VQ,true><<<g1,BLK,0,st>>>(                           \
              q,kp,vp,skp,svp,km,ap,bp,H,Hkv,(int)blk,d,(float)scale,ns,Lc,valid,                      \
-             block_table.data_ptr<int32_t>(),(int)block_size,mb,slp,stp);                             \
+             block_table.data_ptr<int32_t>(),(int)block_size,mb,slp,stp,ctp,tmp_,sIp,sCp,sStr,sBlg,  \
+             (int)qGrp,(int)qCausal);                                                                 \
          reduce_defer_out_kernel<EPT><<<g2,256,0,st>>>(ap,bp,op,H,d,ns,(long)o_row_stride,          \
                                                       fp8 ? (float)v_scale : 1.0f); } while (0)
 #define RUNV(EPT, KVB, GFV) do { if (veqk) RUNK(EPT,KVB,GFV,true); else RUNK(EPT,KVB,GFV,false); } while (0)
@@ -1985,6 +2146,108 @@ std::tuple<torch::Tensor, torch::Tensor> flash_decode_defer_q(torch::Tensor Q, t
     return std::make_tuple(O, Lse.reshape({Bb, H, 1}));
 }
 
+
+// ------------------------------------------------------------------------------------------
+// ХИМЕРНЫЙ ПУТЬ (тензорные ядра + плитка в разделяемой): точка входа и свод срезов.
+// Отдельная функция, а не ветка внутри старой: боевой путь обязан остаться битово прежним,
+// пока новый не пройдёт гейт точности и скорости.
+// ------------------------------------------------------------------------------------------
+__global__ void hmma_svod_kernel(const float* __restrict__ A, const float* __restrict__ B,
+                                 half* __restrict__ Out, int H, int D, int ns, int ldo) {
+    const int стр = blockIdx.x, h = blockIdx.y;
+    const long бб = ((long)стр * H + h) * ns;
+    float M = -CUDART_INF_F;
+    for (int i = 0; i < ns; ++i) M = fmaxf(M, B[(бб + i) * 2]);
+    float L = 0.f;
+    for (int i = 0; i < ns; ++i) {
+        const float m = B[(бб + i) * 2];
+        if (m == -CUDART_INF_F) continue;
+        L += __expf(m - M) * B[(бб + i) * 2 + 1];
+    }
+    const float inv = (L > 0.f) ? 1.0f / L : 0.f;
+    for (int d = threadIdx.x; d < D; d += blockDim.x) {
+        float o = 0.f;
+        for (int i = 0; i < ns; ++i) {
+            const float m = B[(бб + i) * 2];
+            if (m == -CUDART_INF_F) continue;
+            o += __expf(m - M) * A[(бб + i) * (long)D + d];
+        }
+        Out[(long)стр * ldo + h * D + d] = __float2half(o * inv);
+    }
+}
+
+void flash_decode_hmma_paged(torch::Tensor Q, torch::Tensor K, torch::Tensor V,
+                             torch::Tensor block_table, int64_t block_size, double scale,
+                             int64_t num_splits, torch::Tensor seqlens,
+                             torch::Tensor A, torch::Tensor B, torch::Tensor Out, int64_t ldo,
+                             torch::Tensor sK, torch::Tensor sV, int64_t qGrp, int64_t qCausal,
+                             std::optional<torch::Tensor> selCnt = std::nullopt,
+                             std::optional<torch::Tensor> selIdx = std::nullopt, int64_t selBlk = 128) {
+    TORCH_CHECK(Q.scalar_type() == torch::kHalf, "hmma decode: Q half");
+    // [СПИСОК БЛОКОВ ОТБОРА, 14.09] необязательный индекс отбора (cnt [строк, Hkv], idx [строк, Hkv, NB] int32)
+    const int* _sIp = nullptr; const int* _sCp = nullptr; int _sStr = 0, _sBlg = 0;
+    if (selIdx.has_value() && selIdx->defined()) {
+        TORCH_CHECK(selCnt.has_value() && selCnt->defined(), "hmma decode: индекс отбора требует счётчиков");
+        TORCH_CHECK(selIdx->scalar_type() == torch::kInt32 && selCnt->scalar_type() == torch::kInt32
+                    && selIdx->is_contiguous() && selCnt->is_contiguous(), "hmma decode: индекс отбора int32 плотный");
+        TORCH_CHECK((selBlk & (selBlk - 1)) == 0 && selBlk % fa2sm70_dechmma::KT == 0,
+                    "hmma decode: блок отбора -- степень двойки, кратная плитке ", fa2sm70_dechmma::KT);
+        _sIp = selIdx->data_ptr<int32_t>(); _sCp = selCnt->data_ptr<int32_t>(); _sStr = (int)selIdx->size(-1);
+        while ((1LL << _sBlg) < selBlk) ++_sBlg;
+    }
+    TORCH_CHECK(K.scalar_type() == torch::kChar && V.scalar_type() == torch::kChar, "hmma decode: KV int8");
+    const int строк_всего = Q.size(0), H = Q.size(1), D = Q.size(3);
+    TORCH_CHECK(K.dim() >= 3, "hmma decode: пул [.., block, Hkv, D]");
+    TORCH_CHECK(D == 256, "hmma decode: пока только head_dim=256");
+    const int Hkv = K.size(K.dim() - 2), bs = (int)block_size, mb = block_table.size(1);
+    // Шаг блока берём У ТЕНЗОРА, а не выводим из формы: пул может быть строенным видом.
+    const long шаг_блока = K.stride(0) / D;
+    TORCH_CHECK((bs & (bs - 1)) == 0, "hmma decode: block_size обязан быть степенью двойки");
+    int bs_log = 0; while ((1 << bs_log) < bs) ++bs_log;
+    const int B_ = строк_всего / (int)qGrp, GF = H / Hkv;
+    TORCH_CHECK((int)qGrp * GF <= fa2sm70_dechmma::MT, "hmma decode: qGrp*GF > 32");
+    // Строки ОБЯЗАНЫ делиться на qGrp: сетка идёт по запросам, и хвост строк иначе никем не
+    // записывается -- свод прочитает в рабочей области остаток прошлого шага. Предусловие
+    // ФОРМЫ, а не пожелание.
+    TORCH_CHECK(строк_всего % (int)qGrp == 0, "hmma decode: строк ", строк_всего,
+                " не делится на qGrp=", qGrp);
+    const int ns = (int)num_splits;
+    const size_t shmem = sizeof(fa2sm70_dechmma::Obshchaya<256>);
+    // ДИНАМИЧЕСКАЯ РАЗДЕЛЯЕМАЯ СВЫШЕ 48 КиБ ТРЕБУЕТ ЯВНОГО СОГЛАСИЯ, И ЕГО НАДО ПРОВЕРЯТЬ.
+    // Без проверки отказ виден только как МУСОР НА ВЫХОДЕ: ядро не запускается, буфер остаётся
+    // с прошлого шага, а сервер отвечает связным началом и рядами восклицательных знаков.
+    // Ровно это и случилось при первом подключении к бэкенду.
+    static bool _opt = false;
+    if (!_opt) {
+        cudaError_t _e = cudaFuncSetAttribute(fa2sm70_dechmma::decode_hmma_kernel<256>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shmem);
+        // [V3] два блока по ~46 КБ на SM требуют полной выкройки разделяемой (96 КБ на V100)
+        cudaFuncSetAttribute(fa2sm70_dechmma::decode_hmma_kernel<256>,
+                             cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+        TORCH_CHECK(_e == cudaSuccess, "hmma decode: не удалось запросить ", shmem,
+                    " Б разделяемой: ", cudaGetErrorString(_e));
+        _opt = true;
+    }
+    dim3 grid(B_, Hkv, ns), blk(fa2sm70_dechmma::NT);
+    auto st = at::cuda::getCurrentCUDAStream();
+    fa2sm70_dechmma::decode_hmma_kernel<256><<<grid, blk, shmem, st>>>(
+        reinterpret_cast<const __half*>(Q.data_ptr<at::Half>()),
+        K.data_ptr<int8_t>(), V.data_ptr<int8_t>(),
+        sK.numel() ? sK.data_ptr<float>() : nullptr, sV.numel() ? sV.data_ptr<float>() : nullptr,
+        A.data_ptr<float>(), B.data_ptr<float>(), H, Hkv, 0, (float)scale, ns,
+        block_table.data_ptr<int>(), bs_log, mb, seqlens.data_ptr<int>(), (int)qGrp, GF, (int)qCausal,
+        шаг_блока, _sIp, _sCp, _sStr, _sBlg);
+    {   // Отказ запуска обязан быть ГРОМКИМ, а не тихой порчей выхода.
+        cudaError_t _l = cudaGetLastError();
+        TORCH_CHECK(_l == cudaSuccess, "hmma decode: запуск ядра отвергнут: ",
+                    cudaGetErrorString(_l), " (shmem=", shmem, ")");
+    }
+    dim3 g2(строк_всего, H);
+    hmma_svod_kernel<<<g2, 128, 0, st>>>(A.data_ptr<float>(), B.data_ptr<float>(),
+                                         reinterpret_cast<half*>(Out.data_ptr<at::Half>()),
+                                         H, D, ns, (int)ldo);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("flash_decode", &flash_decode, "sm70 split-KV flash-decoding (fp16 exact; optional softcap / ALiBi)",
           pybind11::arg("Q"), pybind11::arg("K"), pybind11::arg("V"), pybind11::arg("scale"), pybind11::arg("num_splits"),
@@ -2044,7 +2307,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           // вызовом, а не предположено (см. комментарий у сигнатуры про None -> torch::Tensor).
           py::arg("sK") = std::nullopt, py::arg("sV") = std::nullopt,
           // [ОКНО] Левая граница ключей на последовательность (int32 [B]); None = 0 = прежнее поведение.
-          py::arg("kv_start") = std::nullopt);
+          py::arg("kv_start") = std::nullopt,
+          // [ДЕРЕВО] Граница контекста и битовая маска хвоста на строку; None = цепь, как было.
+          py::arg("ctxlen") = std::nullopt, py::arg("tailmask") = std::nullopt,
+          // Индекс отобранных блоков: без него путь плотный и прежний до бита.
+          py::arg("selCnt") = std::nullopt, py::arg("selIdx") = std::nullopt,
+          py::arg("selBlk") = 128, py::arg("qGrp") = 1, py::arg("qCausal") = 1);
     m.def("flash_decode_defer_mqa_paged_i8", &flash_decode_defer_mqa_paged_i8,
           "sm70 paged deferred decode over OUR int8 KV pool (per-(token,kv-head) scales, block-table indexed)",
           py::arg("Q"), py::arg("Kcache"), py::arg("sK"), py::arg("Vcache"), py::arg("sV"), py::arg("Kmax"),
@@ -2061,6 +2329,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("num_splits"), pybind11::arg("kv_len"), pybind11::arg("seqlens"));
     m.def("flash_decode_defer_mqa", &flash_decode_defer_mqa, "sm70 MQA/GQA-aware deferred decode (fuse GF query heads, shared KV read once)",
           pybind11::arg("Q"), pybind11::arg("K"), pybind11::arg("V"), pybind11::arg("Kmax"), pybind11::arg("scale"), pybind11::arg("num_splits"), pybind11::arg("kv_len") = 0);
+    m.def("flash_decode_hmma_paged", &flash_decode_hmma_paged,
+          "sm70 химерный декод: плитка K/V в разделяемой + обе GEMM на тензорных ядрах; selCnt/selIdx/selBlk -- список блоков отбора",
+          pybind11::arg("Q"), pybind11::arg("K"), pybind11::arg("V"), pybind11::arg("block_table"),
+          pybind11::arg("block_size"), pybind11::arg("scale"), pybind11::arg("num_splits"),
+          pybind11::arg("seqlens"), pybind11::arg("A"), pybind11::arg("B"), pybind11::arg("Out"),
+          pybind11::arg("ldo"), pybind11::arg("sK"), pybind11::arg("sV"),
+          pybind11::arg("qGrp") = 1, pybind11::arg("qCausal") = 1,
+          pybind11::arg("selCnt") = std::nullopt, pybind11::arg("selIdx") = std::nullopt, pybind11::arg("selBlk") = 128);
     m.def("flash_decode_defer_q", &flash_decode_defer_q, "sm70 deferred-rescale + int8/int4 KV (long-context optimum)",
           pybind11::arg("Q"), pybind11::arg("Kq"), pybind11::arg("sK"), pybind11::arg("Vq"), pybind11::arg("sV"),
           pybind11::arg("Kmax"), pybind11::arg("scale"), pybind11::arg("num_splits"), pybind11::arg("bits"),

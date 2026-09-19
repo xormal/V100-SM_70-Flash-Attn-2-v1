@@ -78,8 +78,15 @@ int main(int argc, char** argv) {
   constexpr int DV = FA2_DV, LDQ = (FA2_WS ? D : DC) + 4, LDP = BK + 4, LDK8 = (FA2_WS ? D : DC) + 16, LDV = DV + 16;
   const size_t sh = (size_t)(BQ * LDQ + BQ * LDP) * sizeof(__half) + (size_t)(FA2_WS ? 2 : 1) * BK * (LDK8 + LDV);
 #if FA2_WS
-  auto kern = causal ? fa2_sm70::fwd_ws::volta_fwd_ws<BQ, BK, D, WM, WN, true,  DC, MINB, 1, DV>
-                     : fa2_sm70::fwd_ws::volta_fwd_ws<BQ, BK, D, WM, WN, false, DC, MINB, 1, DV>;
+#ifndef FA2_DIAG
+#define FA2_DIAG 0
+#endif
+#ifndef FA2_PHSPLIT
+#define FA2_PHSPLIT 0
+#endif
+  // полный список доводов шаблона: KVFMT=0, WIDE=0, SWZ=0, DIAG, PHSPLIT, KSP=1, KSPL=0, PAGED=0 (боевой: PHSPLIT=1, PAGED=1)
+  auto kern = causal ? fa2_sm70::fwd_ws::volta_fwd_ws<BQ, BK, D, WM, WN, true,  DC, MINB, 1, DV, 0, 0, 0, FA2_DIAG, FA2_PHSPLIT, 1, 0, 0>
+                     : fa2_sm70::fwd_ws::volta_fwd_ws<BQ, BK, D, WM, WN, false, DC, MINB, 1, DV, 0, 0, 0, FA2_DIAG, FA2_PHSPLIT, 1, 0, 0>;
   const int kThreads = ((FA2_WSPROD > 0 ? FA2_WSPROD : WM * WN) + WM * WN) * 32;
 #else
   auto kern = causal ? fa2_sm70::fwd_i8::volta_fwd_i8<BQ, BK, D, WM, WN, true,  DC, MINB, 1, DV>
@@ -104,7 +111,7 @@ int main(int argc, char** argv) {
       (long)D, (long)Sk * D, (long)Hkv * Sk * D,
       (long)H * D, (long)D, (long)Sq * H * D,
       (long)lse_dim, (long)H * lse_dim,
-      (long)Sk, (long)Hkv * Sk, dPh, dRole);
+      (long)Sk, (long)Hkv * Sk, dPh, dRole, nullptr, nullptr, 0, nullptr, nullptr, 0, 1, 0, 1, nullptr, nullptr);
   CK(cudaDeviceSynchronize());
   CK(cudaGetLastError());
 
@@ -114,7 +121,7 @@ int main(int argc, char** argv) {
         dQ_, dKq, dKs, dVq, dVs, dO, dLse, Sq, Sk, sc, H / Hkv, causal ? (Sk - Sq) : 0,
         (long)H * D, (long)D, (long)Sq * H * D, (long)D, (long)Sk * D, (long)Hkv * Sk * D,
         (long)H * D, (long)D, (long)Sq * H * D, (long)lse_dim, (long)H * lse_dim,
-        (long)Sk, (long)Hkv * Sk, dPh, dRole); };
+        (long)Sk, (long)Hkv * Sk, dPh, dRole, nullptr, nullptr, 0, nullptr, nullptr, 0, 1, 0, 1, nullptr, nullptr); };
     for (int i = 0; i < 5; ++i) run();
     CK(cudaDeviceSynchronize()); cudaEventRecord(e0);
     for (int i = 0; i < 20; ++i) run();
@@ -137,6 +144,7 @@ int main(int argc, char** argv) {
       printf("  %-28s %12lld  %5.1f%%\n", nm[i], hp[i], tot ? 100.0 * hp[i] / tot : 0.0);
   }
 #endif
+  if (getenv("FA2_NOREF")) { printf("эталон пропущен (FA2_NOREF)\n"); return 0; }
   std::vector<__half> hO((size_t)B * Sq * H * D);
   CK(cudaMemcpy(hO.data(), dO, hO.size() * 2, cudaMemcpyDeviceToHost));
 

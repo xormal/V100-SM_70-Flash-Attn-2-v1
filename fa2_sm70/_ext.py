@@ -34,8 +34,11 @@ _prefill = None
 _decode = None
 _mxfp4 = None
 _w8a16 = None
+_tm8 = None
+_w12a16 = None
 _backward = None
 _gdn = None
+_mega = None
 _sparse = None
 _preflight_done = False
 
@@ -141,8 +144,11 @@ def _build(name, source, flags, inc=None):
     # которых не имел отношения к правке. Диагноз стоил трёх шагов вместо нуля.
     try:
         os.makedirs(bdir, exist_ok=True)
+        # ФАЛЬСИФИКАТОРЫ СНЯТИЕМ ФАЗЫ -- через окружение, а не правкой исходника: снятая фаза
+        # даёт заведомо неверный ответ, и путь к ней обязан быть виден в команде запуска.
+        доп = os.environ.get("FA2SM70_NVCC_EXTRA", "").split()
         return load(name=name, sources=[os.path.join(_CSRC, source)], build_directory=bdir,
-                    extra_include_paths=inc, extra_cuda_cflags=flags)
+                    extra_include_paths=inc, extra_cuda_cflags=list(flags) + доп)
     except Exception as e:
         msg = str(e).lower()
         hint = ""
@@ -164,8 +170,32 @@ def prefill_ext():
         # [ЗАНЯТОСТЬ] Цель варпов на SM для forward. Штатные 12 (cutlass для pre-Ampere) дают 3 блока
         # и ~168 регистров; 16 дают 4 блока и ~128 регистров. Перебирается FA2SM70_FWD_WARPS_SM.
         _pf = list(_CUTLASS_FLAGS) + [f"-DFMHA_FWD_WARPS_SM={int(os.environ.get('FA2SM70_FWD_WARPS_SM', 12))}"]
+        # [ЗАМЕР ПО ФАЗАМ] FA2SM70_PHASE=1 включает счётчики clock64 в ядре ролей. Это ОТДЕЛЬНАЯ
+        # сборка: clock64 и атомарные сложения сами стоят время, поэтому сравнивать её с боевой по
+        # секундомеру НЕЛЬЗЯ -- читаются только ПРОПОРЦИИ внутри неё. Класть её надо в свой
+        # FA2SM70_BUILD_DIR, иначе она затрёт боевую .so под тем же именем.
+        if os.environ.get("FA2SM70_PHASE", "0") == "1":
+            _pf = _pf + ["-DFA2_PHASE=1"]
+        # [ЧИСЛО ВЕЗУЩИХ ВАРПОВ -- ЭТО ПОТОЛОК РЕГИСТРОВ, А НЕ ТОЛЬКО ПОДАЧА]
+        # __launch_bounds__((WSPROD + 8) * 32, 1) задаёт, сколько регистров вправе взять НИТЬ:
+        # 65536/384 = 170 при четырёх везущих, 204 при двух, 227 при одном. Ядру с широким
+        # накопителем (расщепление по ключам берёт 168 из 170) это и есть стена, а везущие по
+        # замеру фаз простаивают 45.1 % времени. Сборка отдельная -- макрос компиляционный.
+        if os.environ.get("FA2SM70_WSPROD"):
+            _pf = _pf + [f"-DFA2_WSPROD={int(os.environ['FA2SM70_WSPROD'])}"]
         _prefill = _build("fa2sm70_prefill", "attn_fwd_cutlass.cu", _pf, _INC)
     return _prefill
+
+
+_gdn_head = None
+
+
+def gdn_head_ext():
+    """Голова цепочки GDN одним пуском (записка 25 §108): l2norm(q,k) + cumsum(g)."""
+    global _gdn_head
+    if _gdn_head is None:
+        _gdn_head = _build("fa2sm70_gdn_head", "gdn_head.cu", _DECODE_FLAGS)
+    return _gdn_head
 
 
 def decode_ext():
@@ -175,12 +205,35 @@ def decode_ext():
         # FA2SM70_DEC_PF=1 -> cross-iteration KV prefetch in the split decode (A/B knob, see the
         # kernel comment). Off by default until it is measured to pay on this machine.
         _pf = ["-DFA2SM70_DEC_PF=1"] if os.environ.get("FA2SM70_DEC_PF", "0") == "1" else []
-        for _v, _d in (("FA2SM70_DEC_UU", None), ("FA2SM70_DEC_VK", None)):
+        for _v, _d in (("FA2SM70_DEC_UU", None), ("FA2SM70_DEC_VK", None), ("FA2SM70_DEC_QW", None), ("FA2SM70_DEC_BLK", None), ("FA2SM70_DEC_SAH", None)):
             _x = os.environ.get(_v)
             if _x:
                 _pf = _pf + [f"-D{_v}={int(_x)}"]
-        _decode = _build("fa2sm70_decode", "split_decode.cu", _DECODE_FLAGS + _pf)
+        # [РЕГИСТРЫ ДЕКОДНОГО ЯДРА] Замер 01.09: боевой вариант тела расходует REG:201, то есть
+        # 10 варпов на SM из 64 -- занятость 15.6 %. Именно этим объясняется, что ядро идёт в 16
+        # раз медленнее предела памяти (записка 25 §80c-80d): латентность нечем скрывать, а любая
+        # правка, добавляющая регистры, делает хуже. Рычаг позволяет ограничить их числом и
+        # измерить размен «меньше регистров / больше spill» микробенчем за 40 секунд.
+        _rr = os.environ.get("FA2SM70_DEC_MAXREG")
+        if _rr:
+            _pf = _pf + [f"-maxrregcount={int(_rr)}"]
+        # Химерное ядро берёт WarpMma из fa2_src/fmha_kernel/gemm -- тот же примитив, что
+        # у тел GEMM. Заголовки cutlass сюда по-прежнему не тянутся.
+        _decode = _build("fa2sm70_decode", "split_decode.cu", _DECODE_FLAGS + _pf,
+                         inc=[os.path.join(_FA2SRC, "fmha_kernel")])
     return _decode
+
+
+_exch = None
+
+
+def exch_ext():
+    """Упаковка обмена TP в 12 разрядов. Отдельная единица трансляции: ядро крошечное, а собирать
+    его вместе с вниманием значило бы ждать четверть часа ради двух ядер."""
+    global _exch
+    if _exch is None:
+        _exch = _build("fa2sm70_exch", "exch_i12.cu", ["-O3", "-std=c++17", "--use_fast_math"])
+    return _exch
 
 
 def mxfp4_ext():
@@ -197,6 +250,22 @@ def mxfp4_ext():
     return _mxfp4
 
 
+_fusedng = None
+
+
+def fused_norm_gemv_ext():
+    """СЛИТОЕ ТЕЛО: RMSNorm + W8A16 GEMV одним запуском (скелет резидентной схемы, Ш1).
+
+    Отдельное расширение НАМЕРЕННО: это проверка СХЕМЫ, и она не должна пересобирать
+    ни внимание, ни умножение, чтобы гейт сравнивал одно с одним."""
+    global _fusedng
+    if _fusedng is None:
+        _common()
+        _fusedng = _build("fa2sm70_fused_ng", "fused_norm_gemv.cu",
+                          ["-O3", "-std=c++17", "--use_fast_math"])
+    return _fusedng
+
+
 def w8a16_ext():
     """Fused GPTQ-int8 W8A16 GEMV. Separate extension: it is a linear-layer helper, not attention."""
     global _w8a16
@@ -206,6 +275,58 @@ def w8a16_ext():
         _w8a16 = _build("fa2sm70_w8a16", "w8a16_gemv.cu", ["-O3", "-std=c++17", "--use_fast_math"],
                         inc=[os.path.join(_FA2SRC, "fmha_kernel")])
     return _w8a16
+
+
+def tm8_ext():
+    """Задача 191: наш GPTQ-int8 (v1, g=128) на двигателе turbomind s884 при больших M.
+    Заголовки берутся из РАБОЧЕГО дерева форка (vendored turbomind); ни одного нового
+    device-тела — только Config_U8_g + прямой пуск по идиому lm_head_top1."""
+    global _tm8
+    if _tm8 is None:
+        _common()
+        tm_root = os.environ.get(
+            "FA2SM70_TM_ROOT", "/mnt/d1/alex/1Cat-vLLM-fa2-work/csrc/sm70_turbomind/lmdeploy")
+        if not os.path.isdir(os.path.join(tm_root, "src", "turbomind")):
+            raise RuntimeError(f"fa2_sm70: turbomind headers not found at {tm_root} "
+                               f"(set FA2SM70_TM_ROOT to <fork>/csrc/sm70_turbomind/lmdeploy)")
+        # torch вкалывает -D__CUDA_NO_HALF_* по умолчанию; turbomind живёт операторами half —
+        # снимаем их так же, как это делает сборка самого форка.
+        _tm8 = _build("fa2sm70_tm8", "tm8_gemm.cu",
+                      ["-O3", "-std=c++17", "--use_fast_math", "--expt-relaxed-constexpr",
+                       "-U__CUDA_NO_HALF_OPERATORS__", "-U__CUDA_NO_HALF_CONVERSIONS__",
+                       "-U__CUDA_NO_HALF2_OPERATORS__", "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                       "-U__CUDA_NO_BFLOAT16_OPERATORS__", "-U__CUDA_NO_BFLOAT162_OPERATORS__"],
+                      inc=[tm_root])
+    return _tm8
+
+
+def w12a16_ext():
+    """W12A16: вес в 12 разрядах, потребляемый упакованным. Пара к tools/quantize_iN.py."""
+    global _w12a16
+    if _w12a16 is None:
+        _common()
+        # путь к рукописному варповому оператору: w12a16_hmma.cuh считает на ТЕНЗОРНЫХ ядрах
+        _w12a16 = _build("fa2sm70_w12a16", "w12a16.cu", ["-O3", "-std=c++17", "--use_fast_math"],
+                         inc=[os.path.join(_FA2SRC, "fmha_kernel")])
+    return _w12a16
+
+
+def mega_ext():
+    """Мегаядро декода (цепь слоёв). ОТДЕЛЬНОЕ расширение -- `decode_chain` живёт в своём исходнике.
+
+    Проверка наличия входа СРАЗУ при загрузке: сегодня выяснилось на боевом шаге, что модуль с
+    нужным именем есть, а входа в нём нет (класс "идентичность по владению, а не по имени").
+    """
+    global _mega
+    if _mega is None:
+        _common()
+        _mega = _build("fa2sm70_mega", "fused_mlp_body.cu",
+                       ["-O3", "-std=c++17", "--use_fast_math", "--expt-relaxed-constexpr",
+                        "-D__CUDA_NO_HALF_OPERATORS__"])
+        for вход in ("decode_chain", "gdn_layer", "attn_layer", "dense_gemv_norm"):
+            if not hasattr(_mega, вход):
+                raise RuntimeError(f"mega_ext: собран модуль БЕЗ входа '{вход}' -- не тот исходник")
+    return _mega
 
 
 def gdn_ext():
@@ -227,6 +348,43 @@ def gdn_ext():
                        "-D__CUDA_NO_HALF_OPERATORS__"],
                       inc=[os.path.join(_FA2SRC, "fmha_kernel", "gemm")])
     return _gdn
+
+
+_conv = None
+
+
+_i4 = None
+
+
+def i4_ext():
+    """Двухступенчатый аргмакс словаря черновика (записка 25 §238-§239).
+
+    Отдельная единица трансляции по той же причине, что и свёртка: ядро мелкое,
+    ничего тяжёлого не тянет и собирается секундами.
+    """
+    global _i4
+    if _i4 is None:
+        _common()
+        _i4 = _build("fa2sm70_i4", "i4_vocab.cu",
+                     ["-O3", "-std=c++17", "--use_fast_math", "--expt-relaxed-constexpr",
+                      "-D__CUDA_NO_HALF_OPERATORS__"])
+    return _i4
+
+
+def conv_ext():
+    """СВОЯ свёртка состояния GDN (замена чужому Triton-ядру causal_conv1d_update).
+
+    ОТДЕЛЬНАЯ ЕДИНИЦА ТРАНСЛЯЦИИ намеренно: ядро крошечное и не тянет ни
+    cutlass, ни заголовки скана, поэтому собирается секунды, а не минуты, и
+    правка в нём не заставляет пересобирать большие тела.
+    """
+    global _conv
+    if _conv is None:
+        _common()
+        _conv = _build("fa2sm70_conv", "conv_update.cu",
+                       ["-O3", "-std=c++17", "--use_fast_math", "--expt-relaxed-constexpr",
+                        "-D__CUDA_NO_HALF_OPERATORS__"])
+    return _conv
 
 
 def backward_ext():

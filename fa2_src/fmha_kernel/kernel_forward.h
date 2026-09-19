@@ -439,6 +439,12 @@ struct AttentionKernel {
         num_keys = cutlass::fast_min(num_keys, hi_t * (int32_t)kKeysPerBlock);
         output_ptr += split_idx * o_split_stride;
         if (logsumexp_ptr != nullptr) logsumexp_ptr += split_idx * lse_split_stride;
+        // НАКОПИТЕЛЬ ТОЖЕ СВОЙ У КАЖДОГО СРЕЗА. Без этой строки все срезы пишут в один буфер
+        // накопителя и затирают друг друга -- при d > kKeysPerBlock (выход НЕ живёт в регистрах)
+        // это и был источник relL2 1.2e+01..4.8e+01, из-за которого расщепление запретили при
+        // d>128 целиком. Шаг тот же o_split_stride: у накопителя раскладка BSHD [ns,B,Sq,H,D],
+        // у выхода BHSD [ns,B,H,Sq,D] -- РАЗНЫЙ порядок осей, но одинаковое число элементов среза.
+        if (output_accum_ptr != nullptr) output_accum_ptr += split_idx * o_split_stride;
       }
 
       num_queries -= query_start;

@@ -37,6 +37,24 @@
 //     those four columns are ADJACENT, so it is still one 64-bit load. This is what lets the backward
 //     read dO (for dV = P^T dO) and K (for dQ = dS K) WITHOUT transposing them through shared memory.
 #pragma once
+#ifndef FA2_DIAGQ
+#define FA2_DIAGQ 0
+#endif
+#ifndef FA2_PRE2
+#define FA2_PRE2 1   /* замерено лучшим для volta_fwd_so (только accumulate_bi8_pre) */
+#endif
+#ifndef FA2_ROLL_PV
+#define FA2_ROLL_PV 2 /* замерено лучшим для volta_fwd_so (только accumulate_bi8_into) */
+#endif
+#ifndef FA2_DIAGK
+#define FA2_DIAGK 0
+#endif
+#ifndef FA2_DIAGV
+#define FA2_DIAGV 0
+#endif
+#ifndef FA2_DIAGP
+#define FA2_DIAGP 0
+#endif
 
 #include "volta_hmma.h"
 #include "volta_prims.h"   // наши примитивы: перестановка байт, свёртка смещения, правила раскладки
@@ -267,6 +285,40 @@ struct WarpMma {
     }
   }
 
+  // [SWZ ⊕ КОНВЕЙЕР d=256, 11.09] То же свизл-чтение Q, но для КУСКОВОЙ подачи K (DC<D): swizzle
+  // считается по ГЛОБАЛЬНОМУ индексу k = kbase + k, поэтому Q читается из той же свизл-раскладки
+  // полной строки D, а B берётся из текущего куска sB (ldb = DC+PAD). kbase обязан быть кратен 8
+  // (широкая загрузка uint4). Снимает банк-конфликты Q (главный доступ: Q перечитывается на каждой
+  // плитке ключей) БЕЗ отказа от конвейера K (он лишь управляет, когда кусок попал в sB).
+  template <int K>
+  __device__ __forceinline__ void accumulate_swzA_dc(const __half* sA, int lda, int row0, int kbase,
+                                                     const __half* sB, int ldb, int col0, int lane) {
+    static_assert(AL == ALayout::kKMajor, "свизл A реализован для k-мажорной раскладки");
+    static_assert(K % 8 == 0, "широкая загрузка A покрывает два шага k");
+    const int arow = row0 + wmma_a_row(lane);
+    const __half* pa = sA + (long)arow * lda;
+    const int xr = arow & 15;
+    const __half* pb = b_base(sB, ldb, col0, lane);
+    uint4 wa[MB];
+    uint32_t fa[MB][2], fb[2][NB][2];
+    load_b_p(fb[0], pb, ldb, 0);
+#pragma unroll
+    for (int k = 0; k < K; k += 8) {
+      const int off = ((((kbase + k) >> 3) ^ xr) << 3);
+#pragma unroll
+      for (int i = 0; i < MB; ++i)
+        wa[i] = *reinterpret_cast<const uint4*>(pa + (long)(i * 16) * lda + off);
+      if (k + 4 < K) load_b_p(fb[1], pb, ldb, k + 4);
+#pragma unroll
+      for (int i = 0; i < MB; ++i) { fa[i][0] = wa[i].x; fa[i][1] = wa[i].y; }
+      mma(fa, fb[0]);
+      if (k + 8 < K) load_b_p(fb[0], pb, ldb, k + 8);
+#pragma unroll
+      for (int i = 0; i < MB; ++i) { fa[i][0] = wa[i].z; fa[i][1] = wa[i].w; }
+      mma(fa, fb[1]);
+    }
+  }
+
   // Операнд A в m-мажорной раскладке (фаза dQ): k индексирует СТРОКИ, поэтому XOR зависит от k и
   // считается на каждом доступе; широкой загрузки здесь не будет, только совместимость со свизлом.
   template <int K>
@@ -479,6 +531,169 @@ struct WarpMma {
   // независимых цепочек становится восемь, цена -- 8 регистров и 8 FADD на плитку.
   // ВНИМАНИЕ: порядок суммирования меняется, поэтому ответ НЕ побитово тот же (точность при этом
   // не хуже: две частичные суммы -- это шаг попарного суммирования).
+  // [РАЗВЯЗКА РОЛЕЙ S/O, 12.09] То же, что accumulate_bi8 (k-мажорный байтовый B), но A (Q) взят из
+  // ПРЕДЗАГРУЖЕННЫХ регистров fa[K/4][MB][2] -- ни одного чтения A из разделяемой на плитку.
+  // Фальсификатор DIAGQ показал потолок этого хода −10 %; смысл развязки -- не трафик, а перекрытие
+  // софтмакса S-варпов с HMMA O-варпов (записка 26 §3).
+  template <int K, int FMT = 0, int KSP = 1>
+  __device__ __forceinline__ void accumulate_bi8_pre(const uint32_t (&fa)[K / 4][MB][2],
+                                                     const int8_t* sB, int ldb, int col0, int lane) {
+    static_assert(BL == BLayout::kKMajor, "accumulate_bi8_pre: только k-мажорный B (Q*K^T)");
+    static_assert(K % 16 == 0, "широкая загрузка: K кратно 16");
+    const int8_t* pb = b_base_i8(sB, ldb, col0, lane);
+    uint32_t fbA[NB][2], fbB[NB][2];
+    uint4 raw[NB];
+    float acc2[MB][NB][8];                 // KSP=2: нечётные k-шаги -- во вторую цепочку (латентность HMMA)
+    if constexpr (KSP == 2) {
+#pragma unroll
+      for (int i = 0; i < MB; ++i)
+#pragma unroll
+        for (int j = 0; j < NB; ++j)
+#pragma unroll
+          for (int r = 0; r < 8; ++r) acc2[i][j][r] = 0.f;
+    }
+    const int8_t* pbj[NB];
+#if FA2_PRE2
+    // [PRE2] ДВА буфера uint4 по чётности группы из 16 k: группа g+2 грузится, когда группа g отработала, --
+    // задержка LDS.128 укрыта целой группой (8 HMMA), а не одним шагом.
+    uint4 rawN[NB];
+#pragma unroll
+    for (int j = 0; j < NB; ++j) {
+      pbj[j] = pb + (long)(j * 16) * ldb;
+      raw[j]  = *reinterpret_cast<const uint4*>(pbj[j]);
+      rawN[j] = (16 < K) ? *reinterpret_cast<const uint4*>(pbj[j] + 16) : make_uint4(0, 0, 0, 0);
+    }
+#else
+#pragma unroll
+    for (int j = 0; j < NB; ++j) {
+      pbj[j] = pb + (long)(j * 16) * ldb;
+      raw[j] = *reinterpret_cast<const uint4*>(pbj[j]);
+    }
+#endif
+#pragma unroll
+    for (int j = 0; j < NB; ++j) expand_i8<FMT>(raw[j].x, fbA[j][0], fbA[j][1]);
+#pragma unroll
+    for (int k = 0; k < K; k += 4) {
+      const int c = (k >> 2) & 1, t = (k >> 2) & 3;
+      if constexpr (KSP == 2) { if (c) mma_into(acc2, fa[k >> 2], fbB); else mma(fa[k >> 2], fbA); }
+      else mma(fa[k >> 2], c ? fbB : fbA);
+      if (k + 4 < K) {
+#if FA2_PRE2
+        const int g = (k >> 4) & 1;               // чётность текущей группы
+        if (t == 3) {                             // группа кончилась: её буфер -> под группу g+2
+#pragma unroll
+          for (int j = 0; j < NB; ++j) {
+            const uint4 nv = (k + 4 + 16 < K) ? *reinterpret_cast<const uint4*>(pbj[j] + (k + 4 + 16)) : make_uint4(0, 0, 0, 0);
+            if (g) rawN[j] = nv; else raw[j] = nv;
+          }
+        }
+        const int nt = (t + 1) & 3;
+        const int gn = ((k + 4) >> 4) & 1;        // чётность группы следующего шага
+#pragma unroll
+        for (int j = 0; j < NB; ++j) {
+          const uint4 rb = gn ? rawN[j] : raw[j];
+          const uint32_t w = (nt == 0) ? rb.x : (nt == 1) ? rb.y : (nt == 2) ? rb.z : rb.w;
+          if (c) expand_i8<FMT>(w, fbA[j][0], fbA[j][1]);
+          else   expand_i8<FMT>(w, fbB[j][0], fbB[j][1]);
+        }
+#else
+        if (t == 3) {
+#pragma unroll
+          for (int j = 0; j < NB; ++j) raw[j] = *reinterpret_cast<const uint4*>(pbj[j] + (k + 4));
+        }
+        const int nt = (t + 1) & 3;
+#pragma unroll
+        for (int j = 0; j < NB; ++j) {
+          const uint32_t w = (nt == 0) ? raw[j].x : (nt == 1) ? raw[j].y : (nt == 2) ? raw[j].z : raw[j].w;
+          if (c) expand_i8<FMT>(w, fbA[j][0], fbA[j][1]);
+          else   expand_i8<FMT>(w, fbB[j][0], fbB[j][1]);
+        }
+#endif
+      }
+    }
+    if constexpr (KSP == 2) {
+#pragma unroll
+      for (int i = 0; i < MB; ++i)
+#pragma unroll
+        for (int j = 0; j < NB; ++j)
+#pragma unroll
+          for (int r = 0; r < 8; ++r) acc[i][j][r] += acc2[i][j][r];
+    }
+  }
+  // [РАЗВЯЗКА РОЛЕЙ S/O] accumulate_bi8 для n-мажорного байтового B (P*V) с ВНЕШНИМ накопителем:
+  // накопитель O-варпов живёт в union с Q-фрагментами S-варпов, чтобы две роли не держали регистры порознь.
+  template <int K, int FMT = 0>
+  __device__ __forceinline__ void accumulate_bi8_into(float (&dst)[MB][NB][8], const __half* sA, int lda, int row0,
+                                                      const int8_t* sB, int ldb, int col0, int lane) {
+    static_assert(BL == BLayout::kNMajor, "accumulate_bi8_into: только n-мажорный B (P*V)");
+    const __half* pa = a_base(sA, lda, row0, lane);
+    const int8_t* pb = b_base_i8(sB, ldb, col0, lane);
+    uint32_t fa[2][MB][2], fb[2][NB][2];
+    load_a_p(fa[0], pa, lda, 0);
+    load_b_p_i8<FMT>(fb[0], pb, ldb, 0);
+#if FA2_ROLL_PV
+    // [ROLL_PV] тело развёрнуто на 16 k (4 шага, чётность буферов статична), внешний цикл по группам НЕ развёрнут:
+    // код PV меньше вчетверо -- проба гипотезы «no_instruction» (кэш инструкций делят S- и O-варпы одного SMSP).
+    constexpr int kG = (FA2_ROLL_PV == 2) ? 8 : 16;
+    static_assert(K % kG == 0, "ROLL_PV: K кратно телу");
+#pragma unroll 1
+    for (int g = 0; g < K; g += kG) {
+#pragma unroll
+      for (int kk = 0; kk < kG; kk += 4) {
+        const int c = (kk >> 2) & 1, k = g + kk;
+        if (k + 4 < K) { load_a_p(fa[c ^ 1], pa, lda, k + 4); load_b_p_i8<FMT>(fb[c ^ 1], pb, ldb, k + 4); }
+        mma_into(dst, fa[c], fb[c]);
+      }
+    }
+#else
+#pragma unroll
+    for (int k = 0; k < K; k += 4) {
+      const int c = (k >> 2) & 1;
+      if (k + 4 < K) { load_a_p(fa[c ^ 1], pa, lda, k + 4); load_b_p_i8<FMT>(fb[c ^ 1], pb, ldb, k + 4); }
+      mma_into(dst, fa[c], fb[c]);
+    }
+#endif
+  }
+  // [РАЗВЯЗКА РОЛЕЙ, вариант QSMEM] Q из разделяемой (как в ws), но цикл по k СВЁРНУТ по группам 16:
+  // код QK меньше вчетверо -- против «no_instruction» (S- и O-варпы одного SMSP делят кэш инструкций).
+  template <int K, int FMT = 0>
+  __device__ __forceinline__ void accumulate_bi8_roll(const __half* sA, int lda, int row0,
+                                                      const int8_t* sB, int ldb, int col0, int lane) {
+    static_assert(BL == BLayout::kKMajor, "accumulate_bi8_roll: только k-мажорный B");
+    static_assert(K % 16 == 0, "K кратно 16");
+    const __half* pa = a_base(sA, lda, row0, lane);
+    const int8_t* pb = b_base_i8(sB, ldb, col0, lane);
+    uint32_t fa[2][MB][2], fbA[NB][2], fbB[NB][2];
+    uint4 raw[NB];
+    const int8_t* pbj[NB];
+#pragma unroll
+    for (int j = 0; j < NB; ++j) { pbj[j] = pb + (long)(j * 16) * ldb; raw[j] = *reinterpret_cast<const uint4*>(pbj[j]); }
+    load_a_p(fa[0], pa, lda, 0);
+#pragma unroll
+    for (int j = 0; j < NB; ++j) expand_i8<FMT>(raw[j].x, fbA[j][0], fbA[j][1]);
+#pragma unroll 1
+    for (int g = 0; g < K; g += 16) {
+#pragma unroll
+      for (int kk = 0; kk < 16; kk += 4) {
+        const int k = g + kk, c = (kk >> 2) & 1, t = (kk >> 2) & 3;
+        if (k + 4 < K) load_a_p(fa[c ^ 1], pa, lda, k + 4);
+        mma(fa[c], c ? fbB : fbA);
+        if (k + 4 < K) {
+          if (t == 3) {
+#pragma unroll
+            for (int j = 0; j < NB; ++j) raw[j] = *reinterpret_cast<const uint4*>(pbj[j] + (k + 4));
+          }
+          const int nt = (t + 1) & 3;
+#pragma unroll
+          for (int j = 0; j < NB; ++j) {
+            const uint32_t w = (nt == 0) ? raw[j].x : (nt == 1) ? raw[j].y : (nt == 2) ? raw[j].z : raw[j].w;
+            if (c) expand_i8<FMT>(w, fbA[j][0], fbA[j][1]);
+            else   expand_i8<FMT>(w, fbB[j][0], fbB[j][1]);
+          }
+        }
+      }
+    }
+  }
   template <int K, int FMT = 0, int SWZ = 0, int KSP = 1>
   __device__ __forceinline__ void accumulate_bi8(const __half* sA, int lda, int row0,
                                                  const int8_t* sB, int ldb, int col0, int lane) {
@@ -533,13 +748,23 @@ struct WarpMma {
 #pragma unroll
       for (int k = 0; k < K; k += 4) {
         const int c = (k >> 2) & 1, t = (k >> 2) & 3;
+#if FA2_DIAGQ
+        // [ФАЛЬСИФИКАТОР] A (Q) грузится ОДИН раз на плитку и переиспользуется: ответ НЕВЕРЕН,
+        // время -- потолок любого «Q в регистрах». Снимает 64 LDS.64 на плитку на варп (40 % волн).
+        if (k == 0) { fa[1][0][0] = fa[0][0][0]; fa[1][0][1] = fa[0][0][1]; }
+#else
         load_a_p(fa[c ^ 1], pa, lda, k + 4);              // A следующего шага: LSU, независимо
+#endif
         if constexpr (KSP == 2) {                         // нечётные шаги -- во ВТОРУЮ цепочку
           if (c) mma_into(acc2, fa[c], fbB); else mma(fa[c], fbA);
         } else
         mma(fa[c], c ? fbB : fbA);                        // тензорная выдача
         if (k + 4 < K) {                                  // МЕЖДУ MMA: готовим B следующего шага
+#if FA2_DIAGK
+          if (false) {   // [ФАЛЬСИФИКАТОР] K грузится один раз на плитку: ответ неверен, время -- потолок
+#else
           if (t == 3) {
+#endif
 #pragma unroll
             for (int j = 0; j < NB; ++j)   // база уже посчитана; XOR -- перестановка куска (см. SWZ)
               raw[j] = *reinterpret_cast<const uint4*>(pbj[j] + ((k + 4) ^ swj[j]));
@@ -569,7 +794,13 @@ struct WarpMma {
 #pragma unroll
       for (int k = 0; k < K; k += 4) {
         const int c = (k >> 2) & 1;
+#if FA2_DIAGV
+        if (k + 4 < K) { load_a_p(fa[c ^ 1], pa, lda, k + 4); if (k == 0) { for (int j = 0; j < NB; ++j) { fb[1][j][0] = fb[0][j][0]; fb[1][j][1] = fb[0][j][1]; } } }
+#elif FA2_DIAGP
+        if (k + 4 < K) { if (k == 0) { fa[1][0][0] = fa[0][0][0]; fa[1][0][1] = fa[0][0][1]; } load_b_p_i8<FMT>(fb[c ^ 1], pb, ldb, k + 4); }
+#else
         if (k + 4 < K) { load_a_p(fa[c ^ 1], pa, lda, k + 4); load_b_p_i8<FMT>(fb[c ^ 1], pb, ldb, k + 4); }
+#endif
         mma(fa[c], fb[c]);
       }
     }

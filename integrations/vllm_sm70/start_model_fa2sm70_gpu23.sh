@@ -87,6 +87,12 @@ OVERRIDE_GEN_CFG='{"temperature":0.7,"top_p":0.8,"top_k":20,"min_p":0.05,"repeti
 KV_CACHE_BYTES="${KV_CACHE_BYTES:-16106127360}"    # 15 GiB per GPU (AWQ!)
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-262144}"           # 524288 works with VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN="${VLLM_ALLOW_LONG_MAX_MODEL_LEN:-1}"
+# ФРАГМЕНТАЦИЯ ПУЛА -- ОТКАЗ ПО ПАМЯТИ НА ДЛИННОМ ПРОМПТЕ (дефект #169). Замерено 11.08.2026:
+# без этого игла на 64000 слов роняет движок с OOM при 2.49 ГиБ "reserved but unallocated";
+# с ним -- 6/6 игл, ноль OOM, сервер жив. ИМЯ ВАЖНО: torch 2.9 читает ТОЛЬКО
+# PYTORCH_CUDA_ALLOC_CONF (проверено `strings libc10_cuda.so`), новое имя PYTORCH_ALLOC_CONF в
+# этой сборке НЕ читается вовсе -- то есть выглядит выставленным и не действует.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 # NOTE: assign this with a plain `if unset` test, never `${LIMIT_MM:-{...}}` -- brace expansion ends
 # at the first '}' inside the default, which silently appends a stray '}' and yields invalid JSON.
 if [ -z "${LIMIT_MM:-}" ]; then LIMIT_MM='{"image":20,"video":0}'; fi

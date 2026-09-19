@@ -180,8 +180,8 @@ __device__ __forceinline__ void tril_diag_mma(__half* sM, int d, __half* b, int 
 // Полосы 16..31 дублируют 0..15 (col = lane & 15): так адрес заведомо внутри строки чанка, а обмен
 // с полосой k<16 даёт всем одно и то же значение.
 // ---------------------------------------------------------------------------------------------
-template <int LDM, bool SRC_GLOBAL>
-__device__ __forceinline__ void tril_diag_fp32(const float* __restrict__ Ag, long strideR, int rows,
+template <int LDM, bool SRC_GLOBAL, typename AT = float>
+__device__ __forceinline__ void tril_diag_fp32(const AT* __restrict__ Ag, long strideR, int rows,
                                                __half* sM, int d, int lane) {
   const int col = lane & 15, o = 16 * d;
   float X[16];
@@ -189,7 +189,7 @@ __device__ __forceinline__ void tril_diag_fp32(const float* __restrict__ Ag, lon
   for (int i = 0; i < 16; ++i) {
     const int r = o + i;
     float a;
-    if constexpr (SRC_GLOBAL) a = (r < rows) ? Ag[(long)r * strideR + o + col] : 0.f;
+    if constexpr (SRC_GLOBAL) a = (r < rows) ? (float)Ag[(long)r * strideR + o + col] : 0.f;
     else                      a = __half2float(sM[(long)r * LDM + o + col]);
     X[i] = (col < i) ? -a : 0.f;                 // строго нижний + смена знака
   }
@@ -217,9 +217,12 @@ enum : int { kDiagMma = 0, kDiagRowGmem = 1, kDiagRowSmem = 2 };
 // varlen: chunk_indices[i] = (номер последовательности, локальный номер чанка), как у Triton;
 // при nullptr считается одна последовательность длины T.
 // ---------------------------------------------------------------------------------------------
-template <int BT, int DIAG>
+// AT -- тип входной Araw (задача 131, парно с volta_gdn_kkt): при fp16 чтение A вдвое легче, а
+// конверсий на подаче становится НОЛЬ (sM и так fp16). Точность пути задаёт округление ВЫХОДА Ai
+// (замерено в шапке: fp32-чтение диагонали «не даёт ничего»), вход fp16 добавляет тот же класс.
+template <int BT, int DIAG, typename AT = float>
 __global__ __launch_bounds__(128) void volta_gdn_solve_tril(
-    const float* __restrict__ A,          // [B, T, H, BT] fp32, строго нижнетреугольная по чанкам
+    const AT* __restrict__ A,             // [B, T, H, BT] fp32 или fp16, строго нижнетреугольная
     __half* __restrict__ Ai,              // [B, T, H, BT] fp16, пишется ЦЕЛИКОМ (нули верха тоже)
     const int* __restrict__ chunk_indices,
     const int* __restrict__ cu_seqlens,
@@ -251,7 +254,7 @@ __global__ __launch_bounds__(128) void volta_gdn_solve_tril(
   const int ih = blockIdx.y;
   const long strideR = (long)H * BT;
   const long base = ((long)(bos + t0) * H + ih) * BT;
-  const float* Ag = A + base;
+  const AT* Ag = A + base;
   __half* Aig = Ai + base;
 
   // --- ПОДАЧА. Обходим все 16 четвёрок строки, но ЧИТАЕМ только нижние блоки: строка r берёт
@@ -262,11 +265,16 @@ __global__ __launch_bounds__(128) void volta_gdn_solve_tril(
     const int r = i >> 4, q = i & 15;
     uint2 v = make_uint2(0u, 0u);
     if (r < rows && q < 4 * ((r >> 4) + 1)) {
-      const float4 f = *reinterpret_cast<const float4*>(&Ag[(long)r * strideR + 4 * q]);
-      const __half2 lo = __floats2half2_rn(f.x, f.y);
-      const __half2 hi = __floats2half2_rn(f.z, f.w);
-      v.x = *reinterpret_cast<const uint32_t*>(&lo);
-      v.y = *reinterpret_cast<const uint32_t*>(&hi);
+      if constexpr (sizeof(AT) == 2) {
+        // fp16-вход: та же четвёрка -- одна LDG.64, и ни одной конверсии (sM тоже fp16)
+        v = *reinterpret_cast<const uint2*>(&Ag[(long)r * strideR + 4 * q]);
+      } else {
+        const float4 f = *reinterpret_cast<const float4*>(&Ag[(long)r * strideR + 4 * q]);
+        const __half2 lo = __floats2half2_rn(f.x, f.y);
+        const __half2 hi = __floats2half2_rn(f.z, f.w);
+        v.x = *reinterpret_cast<const uint32_t*>(&lo);
+        v.y = *reinterpret_cast<const uint32_t*>(&hi);
+      }
     }
     *reinterpret_cast<uint2*>(&sM[r * LDM + 4 * q]) = v;
   }

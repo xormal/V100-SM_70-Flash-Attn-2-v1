@@ -238,6 +238,16 @@ def _kv_fmt(k_cache: torch.Tensor) -> str:
     return _FMT.get(_cache_key(k_cache), "i8" if _KV_I8 else "e4m3")
 
 
+# ВАРИАНТ ЯДРА РОЛЕЙ, ПРОВЕДЁННЫЙ В БОЕВОЙ ВЫЗОВ.
+# Набор вариантов (широкая перекладка, широкая загрузка + узкая укладка, расщепление накопителя,
+# разведение фаз по строкам, плюс встроенные ФАЛЬСИФИКАТОРЫ фаз) существует в ядре с давних пор,
+# но боевые точки вызова звали `attn_fwd_volta_i8` БЕЗ параметра -- то есть всегда базовым nosc=0.
+# Рычаги были собраны и не заведены в маршрут. Теперь заведены, и развёртку можно гонять СКВОЗЬ
+# СЕРВЕР на боевой форме, а не на стенде с угаданными буферами.
+#   nosc = вариант*100 + формат. 0 -- база. 108/408 -- перекладки. 3008 -- расщепление накопителя.
+#   2008 -- разведение фаз. 11xx..16xx -- ФАЛЬСИФИКАТОРЫ: ответ НЕВЕРЕН, читается только время.
+_WS_NOSC = int(os.environ.get("FA2SM70_WS_NOSC", "0"))
+
 _SAID: set = set()
 
 
@@ -1206,8 +1216,9 @@ def flash_attn_prefill_paged(q, k_cache, v_cache, block_table, seq_lens,
             qc = q if q.is_contiguous() else q.contiguous()
             o, _lse = fa2_sm70._ext.prefill_ext().attn_fwd_volta_i8(
                 qc, kq.unsqueeze(0), ks.unsqueeze(0), vq.unsqueeze(0), vs.unsqueeze(0),
-                float(softmax_scale), True)
-            _say_once("prefill_paged=int8 pool -> byte gather -> role kernel (volta_fwd_ws)")
+                float(softmax_scale), True, _WS_NOSC)
+            _say_once(f"prefill_paged=int8 pool -> byte gather -> role kernel "
+                      f"(volta_fwd_ws, nosc={_WS_NOSC})")
         else:
             # Формы, которых ядро ролей не берёт (d != 256), И маршрут FA2SM70_KV_I8_BYTES=0:
             # разворачиваем в fp16 ТОЧНО (q*s) и идём обычным fp16-ядром. Формат по-прежнему ОДИН --
@@ -1272,7 +1283,11 @@ def flash_attn_prefill_paged(q, k_cache, v_cache, block_table, seq_lens,
         qc = q if q.is_contiguous() else q.contiguous()
         o, _lse = fa2_sm70._ext.prefill_ext().attn_fwd_volta_i8(
             qc, kq.unsqueeze(0), ks.unsqueeze(0), vq.unsqueeze(0), vs.unsqueeze(0),
-            float(softmax_scale), True)
+            float(softmax_scale), True, _WS_NOSC)
+        # У ЭТОЙ ВЕТКИ НЕ БЫЛО СТРОКИ МАРШРУТА -- и опись пути по ядрам молчала о префилле, хотя
+        # ядро работало. Дыра ровно в проверяемости: путь исполнялся, а доказать это было нечем.
+        _say_once(f"prefill_bytes=byte gather (k_scale/v_scale) -> role kernel "
+                  f"(volta_fwd_ws, nosc={_WS_NOSC})")
         if _PROF_PREFILL:
             torch.cuda.synchronize(); _t2 = _t.perf_counter()
             _PP["n"] += 1; _PP["gather"] += _t1 - _t0; _PP["attn"] += _t2 - _t1

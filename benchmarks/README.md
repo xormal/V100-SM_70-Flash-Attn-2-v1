@@ -42,6 +42,7 @@ reported next to latency as `relL2` vs an fp32 exact-softmax reference (`_common
 | `bench_fwd_roles.py` | kernel-only | the byte-KV `d=256` role kernel vs our fp16 kernel, our previous two-block int8 path, cutlass and SDPA-eff; prints results and writes JSON only when `RESULTS_PATH` points outside the repository |
 | `bench_slots_ab.py` | kernel-only | **paired-ratio stopwatch** over the byte-KV formats (`nosc` 0/1/6/7/8) and the issue-slot variants; medians of PAIRED ratios with the formats interleaved WITHIN a round, plus the foreign-process count and clock/power before and after |
 | `bench_i8_beats_e5m2.py` | kernel-only | the same comparison on a second harness and different shapes — kept deliberately as an independent second opinion on the int8-vs-e5m2 margin |
+| `bench_kspl.py` | kernel-only | key-split (`KSPL`) vs the shipped role kernel on the Qwen3.8 prefill shape. **Correctness first, stopwatch second**: it checks both variants against an fp32 reference computed by torch over the same dequantized int8 (a *different* path), and it treats a disagreeing **baseline** as a broken instrument rather than a broken kernel — that positive control is what caught two harness defects (format 8 wants an *interleaved* scale table; near-uniform softmax makes relL2 degenerate). Verdict: correct and slightly more accurate, but x0.905–0.945 |
 
 **Why `bench_slots_ab.py` reports medians of paired ratios rather than a ratio of medians.** V100
 clocks drift over a run; interleaving the variants inside one round hands the drift to both of them

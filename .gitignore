@@ -8,3 +8,26 @@ research*/
 /docs/SPEC_DECODE.md
 .c[l]aude/
 *.pid
+# --- сборочные и временные (задача 184) ---
+*.bak
+*.bak_*
+*.so
+_build/
+.fa2sm70_build*/
+*.ncu-rep
+*.nsys-rep
+*.sqlite
+*.json.gz
+
+# --- запасные копии и рабочий сор (выкладка 19.09) ---
+*.pered_*
+.rabota_*/
+_build_*/
+*.out
+*.do_*
+*.v1_*
+*.v3_*
+*.v4_*
+*.tpt4
+*.bak2
+*.snapshot

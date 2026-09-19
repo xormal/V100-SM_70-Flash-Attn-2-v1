@@ -166,7 +166,37 @@ template <int BQ, int BK, int D, int WM, int WN, bool CAUSAL, int DC = 64, int M
           int PHSPLIT = 0,
           // [KSP] Расщепление цепочки накопителя ПЕРВОГО умножения по k (см. volta_warp_mma.h).
           // Ответ НЕ побитово тот же: меняется порядок суммирования fp32.
-          int KSP = 1>
+          int KSP = 1,
+          // [KSPL -- РАСЩЕПЛЕНИЕ ПО КЛЮЧАМ] 0 = как было (общий максимум, P через разделяемую),
+          // 1 = каждый варп ведёт СВОЮ полосу ключей в ОБОИХ умножениях и свой (m, l), сведение
+          // ОДИН РАЗ в эпилоге. Из мейнлупа уходят ОБА межварповых свода. 2 = то же без
+          // перемасштабирования накопителя (ФАЛЬСИФИКАТОР, ответ неверен).
+          //
+          // [ЗАКРЫТО ЗАМЕРОМ 16.08.2026 -- ЭТО БЫЛ ПОСЛЕДНИЙ НЕЗАКРЫТЫЙ ХОД ЯДРА]
+          // Ответ ВЕРЕН и даже точнее базы (relL2 к fp32-эталону 3.16..3.43e-4 против
+          // 3.40..5.37e-4 на пяти формах, LSE до 2e-6). ВРЕМЯ ХУЖЕ: x0.905 / x0.928 / x0.944
+          // при Sk = 4096 / 16384 / 46002 на боевой форме Qwen3.8.
+          //
+          // ПОЧЕМУ -- НЕ ТО, ЧТО ПРЕДПОЛАГАЛОСЬ. Ход ставился на цифру «38.9 % тактов считающих --
+          // межварповое сведение». Прямое СНЯТИЕ этого свода сдвинуло фазу 3 с 40.5 % до 37.4 %,
+          // то есть барьер и сбор стоили ТРИ ПУНКТА, а не тридцать девять. Фаза 3 -- это
+          // поэлементный проход маски и максимума ПЛЮС ожидание накопителя S, и они на месте.
+          // Исходная атрибуция была ошибкой ЧТЕНИЯ счётчика (в одну фазу сложены разные предметы),
+          // а не ошибкой замера. Три следствия проверены и тоже отвергнуты:
+          //   * перемасштабирование накопителя (вчетверо шире): 3.5 % у базы, 0.6 % здесь -- в тени;
+          //   * потолок регистров (168 из 170 при 12 варпах): при 10 варпах потолок 200, ptxas
+          //     всё равно берёт 168, время НЕ МЕНЯЕТСЯ;
+          //   * число везущих 2 вместо 4 (они простаивают 45 %): время НЕ МЕНЯЕТСЯ.
+          // Не возвращать без НОВОГО замера фазы: снятие свода уже проверено и стоит 3 пункта.
+          int KSPL = 0,
+          // [PAGED -- ЗАДАЧА 163: ЧИТАТЬ СТРАНИЦЫ ПУЛА, А НЕ СОБРАННУЮ ПЛИТУ]
+          // «Привезти много, увезти мало»: KV не должен пересекать HBM трижды (пул -> запись плиты
+          // gather'ом -> чтение плиты ядром). При PAGED=1 везущие варпы читают K/V ПРЯМО из страниц
+          // vLLM-пула ([блоки, 16, Hkv, D] int8) по таблице pageBt, масштабы -- из таблиц пула по
+          // той же странице. Меняется ТОЛЬКО адресация подачи; тело, softmax, эпилог -- байт в байт
+          // те же. Первая версия закреплена на боевой поверхности (KVFMT=0, WIDE=0, без SWZ у
+          // подачи) и на странице РОВНО в 16 токенов -- это проверяет хост, а не надежда.
+          int PAGED = 0>
 __global__ __launch_bounds__(((FA2_WSPROD > 0 ? FA2_WSPROD : WM * WN) + WM * WN) * 32, 1) void volta_fwd_ws(
     const __half* __restrict__ Q,
     const int8_t* __restrict__ Kq, const float* __restrict__ Ks,   // K int8 + масштаб на позицию
@@ -175,7 +205,44 @@ __global__ __launch_bounds__(((FA2_WSPROD > 0 ? FA2_WSPROD : WM * WN) + WM * WN)
     int Sq, int Sk, float qk_scale, int kv_ratio, int causal_off,
     long q_sM, long q_sH, long q_sB, long k_sM, long k_sH, long k_sB,
     long o_sM, long o_sH, long o_sB, long lse_sH, long lse_sB, long ks_sH, long ks_sB,
-    long long* __restrict__ phase_acc = nullptr, int* __restrict__ sm_role = nullptr) {
+    long long* __restrict__ phase_acc = nullptr, int* __restrict__ sm_role = nullptr,
+    // PAGED: ВИРТУАЛЬНЫЕ 16-страницы. Хост режет страницу пула ЛЮБОГО размера (у нативного
+    // 1568 токенов) на куски по 16 и отдаёт готовые БАЙТОВЫЕ смещения данных (pageOff) и базы
+    // индексов масштабов (pageScl) на каждый кусок: ядро не знает bs и не делит на 1568.
+    const long* __restrict__ pageOff = nullptr, const long* __restrict__ pageScl = nullptr,
+    int pageHkv = 0,
+    // [РАЗРЕЖЕННЫЙ ОБХОД -- ЭТАП 2, записка 20]
+    // Разреженность здесь -- это подмена ОДНОГО отображения t -> kb, и больше ничего.
+    // Везущий и считающий вычисляют его НЕЗАВИСИМО по одному и тому же индексу, поэтому
+    // пропуск блоков НЕ требует ни одной новой синхронизации: ролевой контур не меняется
+    // (это и есть приём CSR-обхода из FlashPrefill V2 §3.3, там же и обоснование).
+    // selIdx == nullptr -> путь ПЛОТНЫЙ, байт в байт прежний.
+    const int* __restrict__ selIdx = nullptr,   // [nScoreTiles, Hkv, selStride] -- номера блоков
+    const int* __restrict__ selCnt = nullptr,   // [nScoreTiles, Hkv] -- сколько отобрано
+    int selStride = 0,                          // шаг индекса (NB)
+    int selGroup = 1,                           // сколько блоков запросов ядра на одну плитку счёта
+    int selSub = 0,                             // ЛОГАРИФМ отношения (блок индекса / плитка BK)
+    // [РАСЩЕПЛЕНИЕ ПО КЛЮЧАМ -- задача длинного декода, записка 24]
+    // Зачем: при декоде выше порога Sq = k+1 = 4, и сетка ((Sq+BQ-1)/BQ, H, B) = 12 блоков на
+    // 80 SM. Замер на здоровой карте: время ПОЧТИ НЕ ЗАВИСИТ от H (H=2 -> 4611 мкс,
+    // H=12 -> 3933 при Sk=65536), то есть машина недогружена, а не перегружена чтением.
+    // 12 блоков дают 102 ГБ/с из 800. Расщепление режет ДИАПАЗОН ПЛИТОК КЛЮЧЕЙ между блоками
+    // grid.z: каждый ведёт СВОЙ онлайн-софтмакс, а сводит их готовое ядро
+    // `fwd_combine_splits_kernel` (оно уже есть и используется cutlass-путём).
+    // kSplit = 1 -> путь БАЙТ В БАЙТ прежний (все ветки ниже под `if`).
+    int kSplit = 1,
+    float* __restrict__ Opart = nullptr,        // [срез, B, H, Sq, D] fp32 -- выход среза
+    float* __restrict__ LSEpart = nullptr) {    // [срез, B, H, Sq] fp32 -- LSE среза
+  // [KSPL ОТПУЩЕН НА ПОСТРАНИЧНЫЙ ПУТЬ, 27.08] Запрет был КОНСЕРВАТИВНЫМ, а не доказанным:
+  // PAGED меняет ТОЛЬКО адресацию подачи (везущие варпы читают страницы пула), а KSPL трогает
+  // софтмакс и эпилог -- непересекающиеся части. Проверяется ГЕЙТОМ ТОЧНОСТИ против битового
+  // эталона KSPL=0, а не надеждой. Остальные три условия оставлены как были.
+  // [PHSPLIT ОТПУЩЕН НА ПОСТРАНИЧНЫЙ ПУТЬ, 30.08] Запрет был того же рода, что снятый с KSPL:
+  // консервативным, а не доказанным. PHSPLIT -- это ДВЕ строки погруппных барьеров вместо общих
+  // рандеву считающих; подачи (единственного, что меняет PAGED) он не касается вовсе.
+  // Проверяется ГЕЙТОМ ТОЧНОСТИ против PHSPLIT=0, а не надеждой.
+  static_assert(PAGED == 0 || (WIDE == 0 && KVFMT == 0 && DIAG == 0),
+                "PAGED: первая версия закреплена на боевой поверхности формата 0");
   // [ЧИСЛО ВЕЗУЩИХ -- ОТДЕЛЬНЫЙ ПАРАМЕТР] Профиль после первой версии дал mio_throttle 0.99 (вырос
   // вдвое): восемь варпов, занятых ТОЛЬКО подачей, набивают одну очередь. Двенадцать считающих
   // сетка не допускает (при BQ=32/BK=64 законны 1,2,4,8), значит уменьшаем ВЕЗУЩИХ.
@@ -213,6 +280,12 @@ __global__ __launch_bounds__(((FA2_WSPROD > 0 ? FA2_WSPROD : WM * WN) + WM * WN)
   __half* sP = sQ + BQ * LDQ;             // [BQ][LDP]
   int8_t* sBuf = reinterpret_cast<int8_t*>(sP + BQ * LDP);   // два буфера [K|V] подряд
   constexpr int kBuf = BK * (LDK8 + LDV);
+  // [ОПРОВЕРГНУТО 15.08.2026: ДОПОЛНЕНИЕ ПРОТИВ КОНФЛИКТА БАНКОВ ЗДЕСЬ ДАЁТ НОЛЬ]
+  // Довод был по нашему же закону размещения: шаг WN=4 слова разносит соседние СТРОКИ на 16 Б,
+  // полосы варпа бьют в один банк, нечётный шаг (WN+1) их разводит. Собрано, ответ ПОБИТОВО
+  // ТОЖДЕСТВЕН, время x1.011 / x1.000 / x1.001 на Sk=4096/16384/46002 -- то есть НОЛЬ.
+  // Причина: свод читается ОДИН РАЗ на плитку, по WN значений на строку -- это единицы обращений
+  // против тысяч у мейнлупа. Конфликт существует, но он НЕ В ПЕРИОДЕ. Не возвращать без замера фазы.
   __shared__ float sRedM[BQ * WN];
     // ДВА значения на (строку, варп): софтмаксовая сумма И накопитель смещения разворота V.
   // Второе -- не украшение: без него ответ тихо неверен, см. блок про ранг-1 у второго умножения.
@@ -305,16 +378,27 @@ __shared__ float sRedS[BQ * WN * 2];
   const int q0 = (REV ? (int)(gridDim.x - 1 - blockIdx.x) : (int)blockIdx.x) * BQ;
   constexpr int kSlices = D / DV;
   const int vslice = (int)(blockIdx.y % kSlices), voff = vslice * DV;
+  // PAGED: K/V/масштабы НЕ смещаются на голову -- у пула голова живёт ВНУТРИ страницы
+  // ([блоки, 16, Hkv, D]), поэтому её смещение входит в постраничный адрес, а не в базу.
+  long pgHead = 0;   // hkv для постраничной адресации (0 в обычном режиме)
   {
-    const long h = blockIdx.y / kSlices, b = blockIdx.z, hkv = h / kv_ratio;
+    // При расщеплении grid.z несёт ПАРУ (батч, срез): b = z / kSplit, срез = z % kSplit.
+    const long h = blockIdx.y / kSlices;
+    const long b = (kSplit > 1) ? ((long)blockIdx.z / kSplit) : (long)blockIdx.z;
+    const long hkv = h / kv_ratio;
     Q += b * q_sB + h * q_sH; O += b * o_sB + h * o_sH;
-    Kq += b * k_sB + hkv * k_sH; Vq += b * k_sB + hkv * k_sH;
-    Ks += b * ks_sB + hkv * ks_sH; Vs += b * ks_sB + hkv * ks_sH;
+    if constexpr (!PAGED) {
+      Kq += b * k_sB + hkv * k_sH; Vq += b * k_sB + hkv * k_sH;
+      Ks += b * ks_sB + hkv * ks_sH; Vs += b * ks_sB + hkv * ks_sH;
+    } else {
+      pgHead = hkv;
+    }
     Lse += b * lse_sB + h * lse_sH;
   }
 
 
-  WarpMma<OM / 16, ON / 16, BLayout::kNMajor> o; o.clear();
+  constexpr int ONo = KSPL ? DV : ON;      // ширина полосы выхода на варп
+  WarpMma<OM / 16, ONo / 16, BLayout::kNMajor> o; o.clear();
   // [СВЁРТКА СМЕЩЕНИЯ У ВТОРОГО УМНОЖЕНИЯ] Плитка V тоже развёрнута как 1152+v, поэтому
   //     O_raw[i][d] = sum_j P'[i][j]*(1152 + V[j][d]) = sum_j P'*V + 1152 * sum_j P'[i][j]
   // Второе слагаемое НЕ ЗАВИСИТ ОТ d -- ранг-1 по строке запроса, но, в отличие от K, его надо
@@ -388,7 +472,60 @@ __shared__ float sRedS[BQ * WN * 2];
   // Защёлки на kAllThr нитей: в каждой участвуют ОБЕ группы (везущие приходят bar.arrive, считающие
   // ждут bar.sync -- вместе это полный счёт). Внутренние синхронизации считающих идут по барьеру 3
   // на kConsThr: обычный __syncthreads там ПОВЕСИТ блок, потому что требует все kAllThr нитей.
-  const int nTiles = (kEnd + BK - 1) / BK;
+  // [ОТОБРАЖЕНИЕ ПЛИТКИ] Плотный путь: kb = t * BK. Разреженный: t-я ОТОБРАННАЯ плитка.
+  // Блок индекса крупнее плитки ядра в selSub раз, поэтому один отобранный блок разворачивается
+  // в selSub подряд идущих плиток -- деления на рантайме нет, только сдвиг и маска.
+  const int* _selI = nullptr; int _selN = 0;
+  if (selIdx != nullptr) {
+    // [ПЛИТКА СЧЁТА БЕРЁТСЯ ИЗ q0, А НЕ ИЗ blockIdx.x] При REV=1 (а постраничный путь идёт
+    // именно так) порядок блоков ОБРАТНЫЙ: q0 = (gridDim.x-1-blockIdx.x)*BQ. Строка индекса,
+    // взятая по blockIdx.x, достаётся ЗЕРКАЛЬНОЙ плитке. Дефект тихий: при равномерном индексе
+    // (все счётчики равны) он не виден вовсе, а при поплиточном роняет ровно ту половину плиток,
+    // которой зеркало отдаёт МЕНЬШЕЕ покрытие. Так и было поймано -- сравнением равномерного
+    // индекса с поплиточным при ОДНОМ И ТОМ ЖЕ счётчике.
+    const int _st = q0 / (BQ * selGroup), _hk = (kv_ratio > 0) ? (blockIdx.y / kv_ratio) : 0;
+    const int _hkv = (pageHkv > 0) ? pageHkv : 1;
+    _selI = selIdx + ((size_t)_st * _hkv + _hk) * (size_t)selStride;
+    _selN = selCnt[(size_t)_st * _hkv + _hk];
+  }
+  const int nTiles = (_selI != nullptr) ? (_selN << selSub) : ((kEnd + BK - 1) / BK);
+  // [СРЕЗ ДИАПАЗОНА ПЛИТОК] Абсолютные индексы плиток СОХРАНЯЮТСЯ -- от них зависит чётность
+  // двойного буфера (`tw & 1` у везущих и `tIdx & 1` у считающих), и разъехаться им нельзя.
+  // Меняются только границы обхода; счёт встреч у обеих ролей остаётся равным (tEnd - tBeg).
+  // [РАЗДАЧА С ОСТАТКОМ, А НЕ ПОТОЛКОМ] Первая редакция брала perT = ceil(nTiles/kSplit) --
+  // и при kSplit, НЕ делящем nTiles, хвостовые срезы оставались ПУСТЫМИ (tBeg >= nTiles).
+  // Пустой срез не пишет свою площадку, а Lpart -- torch::empty: сводящее ядро читало мусор,
+  // случайно конечный, и брало пустой срез за активный. Замер: relL2 к нерасщеплённому шёл
+  // 1.0e+00 при 64 пустых из 192, 5.0e-01 при 21, 2.0e-01 при 5 -- ровно ДОЛЯ пустых.
+  // Дефект НЕВИДИМ на лестнице из степеней двойки: они делят nTiles нацело, пустых нет.
+  // Здесь остаток раздаётся первым (nTiles % kSplit) срезам: пустых не бывает по построению,
+  // и заодно снимается перекос последнего среза.
+  const int _spl  = (kSplit > 1) ? ((int)blockIdx.z % kSplit) : 0;
+  const int _base = (kSplit > 1) ? (nTiles / kSplit) : nTiles;
+  const int _rem  = (kSplit > 1) ? (nTiles % kSplit) : 0;
+  const int tBeg  = (kSplit > 1) ? (_spl * _base + (_spl < _rem ? _spl : _rem)) : 0;
+  const int tEnd  = (kSplit > 1) ? (tBeg + _base + (_spl < _rem ? 1 : 0)) : nTiles;
+  // Базы площадок среза: раскладка [срез, B, H, Sq, D] и [срез, B, H, Sq] -- ровно та, которую
+  // ждёт `fwd_combine_splits_kernel` (строка row = bh*Sq + q, o_base = row*D).
+  float* __restrict__ Op = nullptr;
+  float* __restrict__ Lp = nullptr;
+  if (Opart != nullptr) {
+    // b/h выше объявлены В ЧУЖОЙ области видимости -- пересчитываем здесь, тем же выражением.
+    const long nH = (long)gridDim.y / kSlices;
+    const long nB = (long)gridDim.z / (kSplit > 0 ? kSplit : 1);
+    const long _hh = (long)blockIdx.y / kSlices;
+    const long _bb = (kSplit > 1) ? ((long)blockIdx.z / kSplit) : (long)blockIdx.z;
+    const long bh = _bb * nH + _hh;
+    Op = Opart  + (long)_spl * nB * nH * (long)Sq * D + bh * (long)Sq * D;
+    Lp = LSEpart + (long)_spl * nB * nH * (long)Sq     + bh * (long)Sq;
+  }
+  // [СДВИГ, А НЕ ДЕЛЕНИЕ]  selSub -- это log2 отношения (блок индекса / плитка ключей), и хост
+  // проверяет, что отношение -- степень двойки. Прежде здесь стояли `/ selSub` и `% selSub`
+  // с РАНТАЙМОВЫМ делителем: два целочисленных деления (~20 команд каждое) на КАЖДУЮ плитку,
+  // причём в цепи адреса подачи. Замер цены обвязки: при полном индексе (98.5 % блоков)
+  // разреженный путь шёл x0.93 к плотному -- то есть механика стоила 7-8 % НИ ЗА ЧТО.
+#define FA2_KB_OF(t) ((_selI != nullptr) \
+    ? (((_selI[(t) >> selSub] << selSub) | ((t) & ((1 << selSub) - 1))) * BK) : ((t) * BK))
   if (isProd) {
     // ХВОСТ: цикл идёт на ДВЕ итерации дольше. На последних двух готовить нечего, но дойти до
     // bar.arrive обязательно -- иначе считающие зависнут на bar.sync READY. Классическое место
@@ -401,14 +538,17 @@ __shared__ float sRedS[BQ * WN * 2];
     // везущие наполняют ОДИН, считающие читают ДРУГОЙ -- они не пересекаются ПО ПОСТРОЕНИЮ, и
     // второе подтверждение не нужно.
     // Пролог: плитка 0 готовится ДО первого рандеву, иначе считающим нечего брать.
-    for (int t = -1; t < nTiles; ++t) {
-      if (t >= 0) { PH(1); asm volatile("bar.sync 1, %0;" :: "r"(kAllThr)); PH(0); }
+    for (int t = tBeg - 1; t < tEnd; ++t) {
+      if (t >= tBeg) { PH(1); asm volatile("bar.sync 1, %0;" :: "r"(kAllThr)); PH(0); }
       const int tw = t + 1;                      // готовим СЛЕДУЮЩУЮ плитку
-      if (tw < nTiles) {
-        const int kb = tw * BK;
+      if (tw < tEnd) {
+        const int kb = FA2_KB_OF(tw);
         int8_t* dK = sBuf + (tw & 1) * kBuf;
         int8_t* dV = dK + BK * LDK8;
-        const int rv = (kb + BK <= Sk) ? BK : (Sk - kb);
+        // [ПЛИТКА ЗА КОНЦОМ КОНТЕКСТА] Плотный путь до неё не доходит (nTiles считается по kEnd),
+        // а РАЗРЕЖЕННЫЙ может: последний блок индекса крупнее плитки и способен выйти за Sk.
+        // Тогда (Sk - kb) ОТРИЦАТЕЛЕН -- лечится зажимом в ноль, плитка просто пуста.
+        const int rv = (kb + BK <= Sk) ? BK : ((Sk > kb) ? (Sk - kb) : 0);
         // [ФАЗА: обращение за масштабами УХОДИТ ПЕРВЫМ] Его задержка прячется под перекладкой
         // байтов, которая идёт следом; укладка в разделяемую -- уже после неё.
         float2 scPre = make_float2(0.f, 0.f);
@@ -450,6 +590,39 @@ __shared__ float sRedS[BQ * WN * 2];
         unsigned qk = (unsigned)__cvta_generic_to_shared(dK + r0 * LDK8 + c0);
         unsigned qv = (unsigned)__cvta_generic_to_shared(dV + r0 * LDV + c0);
         int rr = r0;
+        if constexpr (PAGED) {
+          // [ЗАДАЧА 163] Строка токена t плитки лежит в странице pageBt[(kb+t)/16] со смещением
+          // ((t%16)*Hkv + hkv)*D -- 256 непрерывных байт, как и в плите; коалесцинг тот же.
+          // [АДРЕС -- ОДИН РАЗ НА ПЛИТКУ, кукбук §П1] Первая редакция читала таблицу страниц на
+          // КАЖДОЙ итерации, сажая задержку L1 в ЦЕПЬ адреса данных, -- x3.5 замером. Здесь базы
+          // четырёх страниц плитки считаются ДО цикла, а в развёрнутом цикле смещение -- константа
+          // компилятора: та же арифметика, что у линейной плиты, плюс 4 чтения таблицы на плитку.
+          static_assert(BK % 16 == 0, "PAGED: плитка кратна странице");
+          // [ИНДЕКС СТРАНИЦЫ -- КОМПИЛЯТОРНАЯ КОНСТАНТА, А НЕ ДИНАМИКА] pgBase[rr>>4] с
+          // переменным индексом отправлял массив в локальную память (LDL/STL в цикле подачи).
+          // Но r0 < kRowK и бит 0..3 не меняют >>4 при kRowK | 16: индекс страницы = (kRowK*u)>>4
+          // -- чистая константа развёрнутого цикла, массив остаётся в регистрах.
+          static_assert(kRowK <= 16 && 16 % kRowK == 0, "PAGED: строки волны внутри страницы");
+          long pgBase[BK / 16];
+#pragma unroll
+          for (int pi = 0; pi < BK / 16; ++pi)
+            pgBase[pi] = (kb + pi * 16 < Sk) ? __ldg(pageOff + (kb >> 4) + pi) : 0;
+          const long pgOff = ((long)pgHead) * D + c0;
+          const long pgRow = (long)pageHkv * D;
+#pragma unroll
+          for (int u = 0; u < (BK * D / 4) / kProdThr; ++u) {
+            uint32_t wk = 0, wv = 0;
+            if (rr < rv) {
+              const long src = pgBase[(kRowK * u) >> 4]
+                             + (long)((r0 + kRowK * u) & 15) * pgRow + pgOff;
+              wk = *reinterpret_cast<const uint32_t*>(Kq + src);
+              wv = *reinterpret_cast<const uint32_t*>(Vq + src);
+            }
+            asm volatile("st.shared.u32 [%0], %1;" :: "r"(qk), "r"(wk));
+            asm volatile("st.shared.u32 [%0], %1;" :: "r"(qv), "r"(wv));
+            qk += kRowK * LDK8; qv += kRowK * LDV; rr += kRowK;
+          }
+        } else {
 #if FA2_SPLITLS
         // [ПЕРЕСТАНОВКА БЕЗ ЕДИНОЙ ИНСТРУКЦИИ] Было: LDG, LDG, STS, STS на каждой итерации -- каждый
         // STS ЖДЁТ свой LDG (это long_scoreboard). Стало: СНАЧАЛА все чтения из глобальной в
@@ -580,6 +753,7 @@ __shared__ float sRedS[BQ * WN * 2];
         }
         }
 #endif
+        }   // конец else (не PAGED)
         }
         if constexpr (kPre) {
           if (tid < BK) { sKs[(tw & 1) * BK + tid] = scPre.x; sVs[(tw & 1) * BK + tid] = scPre.y; }
@@ -600,19 +774,36 @@ __shared__ float sRedS[BQ * WN * 2];
         } else if constexpr (!kNoScale) {
           for (int j = tid; j < BK; j += kProdThr) {     // масштабы плитки
             const int p = kb + j;
-            sKs[(tw & 1) * BK + j] = (p < Sk) ? (kIsI8 ? Ks[p] : 1.f) : 0.f;
-            sVs[(tw & 1) * BK + j] = (p < Sk) ? (kIsI8 ? Vs[p] : 1.f) : 0.f;
+            if constexpr (PAGED) {
+              // Таблицы масштабов пула: [(страница*16 + позиция) * Hkv + голова]. Чтение таблицы
+              // страниц ПОД гвардом p < Sk -- за концом последовательности страницы может не быть.
+              float ks = 0.f, vs = 0.f;
+              if (p < Sk) {
+                const long si = __ldg(pageScl + (p >> 4)) + (long)(p & 15) * pageHkv + pgHead;
+                ks = Ks[si]; vs = Vs[si];
+              }
+              sKs[(tw & 1) * BK + j] = ks;
+              sVs[(tw & 1) * BK + j] = vs;
+            } else {
+              sKs[(tw & 1) * BK + j] = (p < Sk) ? (kIsI8 ? Ks[p] : 1.f) : 0.f;
+              sVs[(tw & 1) * BK + j] = (p < Sk) ? (kIsI8 ? Vs[p] : 1.f) : 0.f;
+            }
           }
         }
       }
       // (разведение по чётности больше не нужно: встреча ОДНА на плитку, и производитель не может
       // уйти вперёд на два прихода -- он ждёт на том же рандеву)
     }
-    PH_OUT(phase_acc);
+    // [НАКОПИТЕЛИ РАЗВЕДЕНЫ ПО РОЛЯМ] Везущие пишут в СВОЮ половину буфера (смещение 8).
+    // Без этого PH(3) у везущих (ожидание рандеву) складывается с PH(3) у считающих (маска и
+    // максимум) в один счётчик -- и читается как «маска стоит 27.7 %», хотя это сумма ОЖИДАНИЯ
+    // одной группы и РАБОТЫ другой. Ровно та ошибка, от которой предупреждает шапка ядра
+    // («фазы разнесены по варпам»), и я на неё уже наступил.
+    PH_OUT(phase_acc ? phase_acc + 8 : phase_acc);
     return;   // [ПОДОЗРЕВАЕМЫЙ 1 СНЯТ] Везущие ОБЯЗАНЫ выйти здесь. Иначе они падают в общий
               // эпилог, где у них wm=wn=0, и не только зависают, но и ПИШУТ В O поверх счёта.
   } else {
-    for (int tIdx = 0; tIdx < nTiles; ++tIdx) {
+    for (int tIdx = tBeg; tIdx < tEnd; ++tIdx) {
       PH(3);
       asm volatile("bar.sync 1, %0;" :: "r"(kAllThr));   // ОДНА встреча: плитка готова И буфер свободен
       // [РАСКОС ВАРПОВ ПО ТАКТУ] Все считающие проходят рандеву РАЗОМ и разом бьют в MIO чтениями
@@ -628,7 +819,7 @@ __shared__ float sRedS[BQ * WN * 2];
       for (int _s = 0; _s < FA2_SKEW * 8; ++_s) if (_s < cw * FA2_SKEW) asm volatile("pmevent 0;");
 #endif
       PH(2);
-      const int kb = tIdx * BK;
+      const int kb = FA2_KB_OF(tIdx);
       // [БАРЬЕР УБРАН] Здесь стоял bar.sync 3 -- остаток исходного цикла. Он ИЗБЫТОЧЕН: барьер
       // готовности плитки (1 или 4) прямо над ним уже синхронизировал ВСЕ нити блока, включая
       // считающих. Два барьера подряд -- это чистая цена без смысла.
@@ -653,8 +844,18 @@ __shared__ float sRedS[BQ * WN * 2];
     } else if constexpr (!kNoScale) {
       for (int j = tid; j < BK; j += kWarps * 32) {
         const int p = kb + j;
-        sKs[(tIdx & 1) * BK + j] = (p < Sk) ? (kIsI8 ? Ks[p] : 1.f) : 0.f;
-        sVs[(tIdx & 1) * BK + j] = (p < Sk) ? (kIsI8 ? Vs[p] : 1.f) : 0.f;
+        if constexpr (PAGED) {
+          float ks = 0.f, vs = 0.f;
+          if (p < Sk) {
+            const long si = __ldg(pageScl + (p >> 4)) + (long)(p & 15) * pageHkv + pgHead;
+            ks = Ks[si]; vs = Vs[si];
+          }
+          sKs[(tIdx & 1) * BK + j] = ks;
+          sVs[(tIdx & 1) * BK + j] = vs;
+        } else {
+          sKs[(tIdx & 1) * BK + j] = (p < Sk) ? (kIsI8 ? Ks[p] : 1.f) : 0.f;
+          sVs[(tIdx & 1) * BK + j] = (p < Sk) ? (kIsI8 ? Vs[p] : 1.f) : 0.f;
+        }
       }
     }
     // [СМЕЩЕНИЕ K -- В ОПЕРАНД C, ЦЕНА НОЛЬ (§4m, пункт 1)]
@@ -723,6 +924,15 @@ __shared__ float sRedS[BQ * WN * 2];
       // по SASS: у KVFMT=11 в мейнлупе НЕТ лишнего FMUL против KVFMT=1).
       if constexpr (kNoScale) v *= qkm;                            // масштаб K свёрнут в Q до запуска
       else                    v *= qkm * sKs[(tIdx & 1) * BK + c0 + c];
+      // [ОПРОВЕРГНУТО 15.08.2026: СНЯТИЕ МАСКИ НА ВИДИМЫХ ПЛИТКАХ ДАЁТ НОЛЬ]
+      // Довод был счётный и выглядел неотразимо: при Sq=4096 плитка ключей лежит ЦЕЛИКОМ под
+      // диагональю в 87.3 % случаев при Sk=16384, 95.4 % при 46002 и 99.1 % при 250000 -- то есть
+      // это сравнение почти всегда тождественно ложно. Быстрый путь (варп-однородная ветка, без
+      // маски) СОБРАН, ПРОВЕРЕН и даёт ПОБИТОВО ТОЖДЕСТВЕННЫЙ ответ -- и x1.001 / x0.997 по
+      // времени, то есть НОЛЬ.
+      // ВЫВОД: два целочисленных сравнения на элемент УЖЕ ЛЕЖАТ В ТЕНИ тензорной трубы. Счёт
+      // операций снова оказался не связан со временем -- ровно тот случай, ради которого в
+      // CLAUDE.md записано «единица анализа -- ФАЗА, а не команда». Не возвращать без ЗАМЕРА фазы.
       if ((CAUSAL && (q0 + r0 + r + causal_off) < kk) || kk >= Sk) v = -CUDART_INF_F;
       const int mb = r >> 4, sub = ((r & 15) - rowbase) >> 1;
       if (v > mloc[mb][sub]) mloc[mb][sub] = v;
@@ -731,17 +941,23 @@ __shared__ float sRedS[BQ * WN * 2];
     for (int i = 0; i < SMB; ++i)
 #pragma unroll
       for (int t = 0; t < 2; ++t) {
-        if constexpr (DIAG == 1) break;      // фальсификатор: редукция максимума снята
+        if constexpr (DIAG == 1) break;
+        // ВНУТРИВАРПОВЫЙ свод нужен И ПРИ KSPL: столбцы одной строки разложены по полосам
+        // lane&2 и lane&4, то есть без этих двух перестановок максимум неполон даже по СВОЕМУ
+        // срезу ключей. Расщепление снимает только МЕЖВАРПОВУЮ часть (запись в sRedM, барьер,
+        // сбор по w) -- ровно те 38.9 % тактов считающих, что дал замер фаз.
         float x = mloc[i][t];
         float y = __shfl_xor_sync(0xffffffffu, x, 2); x = x > y ? x : y;
         y = __shfl_xor_sync(0xffffffffu, x, 4);       x = x > y ? x : y;
         mloc[i][t] = x;
-        if ((lane & 6) == 0) sRedM[(wm * SM + i * 16 + rowbase + 2 * t) * WN + wn] = x;
+        if constexpr (!KSPL)
+          if ((lane & 6) == 0) sRedM[(wm * SM + i * 16 + rowbase + 2 * t) * WN + wn] = x;
       }
-    if constexpr (DIAG != 2) {
+    if constexpr (DIAG != 2 && !KSPL) {
       if constexpr (PHSPLIT) asm volatile("bar.sync %0, %1;" :: "r"(4 + wm), "r"(kConsThr / WM));
       else                   asm volatile("bar.sync 3, %0;" :: "r"(kConsThr));
     }
+    if constexpr (!KSPL)
 #pragma unroll
     for (int i = 0; i < SMB; ++i)
 #pragma unroll
@@ -801,6 +1017,7 @@ __shared__ float sRedS[BQ * WN * 2];
           }
     }
     PH(4);   // ФАЗА 4: exp2 и запись P (SFU + разделяемая)
+    float sloc[SMB][2], vsum[SMB][2];   // при KSPL свод остаётся В РЕГИСТРАХ, мимо разделяемой
 #pragma unroll
     for (int i = 0; i < SMB; ++i)
 #pragma unroll
@@ -809,12 +1026,20 @@ __shared__ float sRedS[BQ * WN * 2];
         float x = lloc[i][t], y = vloc[i][t];
         x += __shfl_xor_sync(0xffffffffu, x, 2); y += __shfl_xor_sync(0xffffffffu, y, 2);
         x += __shfl_xor_sync(0xffffffffu, x, 4); y += __shfl_xor_sync(0xffffffffu, y, 4);
-        if ((lane & 6) == 0) {
+        if constexpr (KSPL) { sloc[i][t] = x; vsum[i][t] = y; }
+        else if ((lane & 6) == 0) {
           const int idx = (wm * SM + i * 16 + rowbase + 2 * t) * WN + wn;
           sRedS[idx] = x; sRedS[BQ * WN + idx] = y;
         }
       }
-    if constexpr (DIAG != 2) {
+    if constexpr (KSPL) {
+      // Барьер здесь стоял РАДИ ДВУХ вещей: свода сумм по варпам и видимости sP для второго
+      // умножения. Свода больше нет, а sP каждый варп читает ТОЛЬКО СВОЙ срез столбцов
+      // [wn*SN, (wn+1)*SN) -- тот же, в который сам писал. Остаётся согласовать полосы ВНУТРИ
+      // варпа (раскладка записи по (row,col) и раскладка чтения фрагмента A -- разные), и это
+      // ровно __syncwarp: на Volta с независимым планированием нитей он обязателен.
+      __syncwarp();
+    } else if constexpr (DIAG != 2) {
       if constexpr (PHSPLIT) asm volatile("bar.sync %0, %1;" :: "r"(4 + wm), "r"(kConsThr / WM));
       else                   asm volatile("bar.sync 3, %0;" :: "r"(kConsThr));
     }
@@ -824,6 +1049,8 @@ __shared__ float sRedS[BQ * WN * 2];
       for (int t = 0; t < 2; ++t) {
         float ss = 0.f, vv = 0.f;
         if constexpr (DIAG == 1) { l_run[i][t] = 1.f; vb_run[i][t] = 0.f; corr2[i][t] = 1.f; break; }
+        if constexpr (KSPL) { ss = sloc[i][t]; vv = vsum[i][t]; }
+        else
 #pragma unroll
         for (int w = 0; w < WN; ++w) {
           const int idx = (wm * SM + i * 16 + rowbase + 2 * t) * WN + w;
@@ -848,8 +1075,23 @@ __shared__ float sRedS[BQ * WN * 2];
         // corr2 передаётся НАПРЯМУЮ: отдельный массив corr был его побайтовой копией и стоил 4 регистра
     // на нить. vv тоже идёт напрямую -- vb_run хранил вклад ОДНОЙ плитки, который тут же и тратится.
     PH(5);   // ФАЗА 5: редукция сумм по варпам (барьер)
-    rescale_fold<float, OM / 16, ON / 16>(o.acc, corr2, kI8Bias, vb_run);   // §2b
-    if constexpr (DIAG != 3 && DIAG != 6) o.template accumulate_bi8<BK, KVFMT>(sP, LDP, wm * OM, sV, LDV, wn * ON, lane);
+    // [ФАЛЬСИФИКАТОР KSPL=2 -- ЦЕНА ПЕРЕМАСШТАБИРОВАНИЯ НАКОПИТЕЛЯ] Ответ НЕВЕРЕН, читается время.
+    // При расщеплении накопитель на варп вырос с ON=64 до DV=256 столбцов, то есть эта строка
+    // трогает 128 регистров на плитку вместо 32 -- и стоит она В ЦЕПИ между двумя умножениями.
+    // Разность 1 и 2 даёт ДОЛЮ этой фазы, а не догадку о ней.
+    // DIAG=7 -- ТОТ ЖЕ фальсификатор на БАЗЕ: без пары «сколько это стоит там» цифра «сколько
+    // здесь» ничего не ранжирует, потому что накопители разного размера.
+    if constexpr (KSPL != 2 && DIAG != 7)
+    rescale_fold<float, OM / 16, ONo / 16>(o.acc, corr2, kI8Bias, vb_run);   // §2b
+    if constexpr (DIAG != 3 && DIAG != 6) {
+      if constexpr (KSPL)
+        // Смещения выражаются УКАЗАТЕЛЕМ: у A (sP) полоса ключей -- это сдвиг по столбцам,
+        // у B (sV) -- по строкам. Примитив MMA трогать не пришлось.
+        o.template accumulate_bi8<SN, KVFMT>(sP + wn * SN, LDP, wm * OM,
+                                             sV + (long)wn * SN * LDV, LDV, 0, lane);
+      else
+        o.template accumulate_bi8<BK, KVFMT>(sP, LDP, wm * OM, sV, LDV, wn * ON, lane);
+    }
     /* снято предвычитанием выше -- блок оставлен выключенным как след разбора
     // [СНИМАТЬ СМЕЩЕНИЕ НА КАЖДОЙ ПЛИТКЕ, А НЕ КОПИТЬ ДО ЭПИЛОГА]
     // Копить нельзя: накопитель тогда держит величину ~1152*sum(P), то есть на порядок больше
@@ -871,7 +1113,101 @@ __shared__ float sRedS[BQ * WN * 2];
     }
   }
   PH_OUT(phase_acc);
-  {                                                    // эпилог: O = acc / l, LSE = m + log(l)
+  if constexpr (KSPL) {
+    // ==================== СВОД РАСЩЕПЛЕНИЯ ПО КЛЮЧАМ (ОДИН РАЗ НА БЛОК) ====================
+    // Каждый из WN варпов вёл СВОЙ срез ключей и потому свою тройку (O, m, l) на ОДНИ И ТЕ ЖЕ
+    // строки. Склейка -- та же, что у флеш-внимания между плитками, только между варпами:
+    //     m = max_w m_w;   l = sum_w l_w * 2^(m_w - m);   O = sum_w O_w * 2^(m_w - m).
+    // Цена -- WN проходов по площадке подачи ОДИН РАЗ на блок; снято -- два межварповых свода
+    // НА КАЖДУЮ плитку ключей (их у боевой формы 256..719).
+    const int r0 = wm * OM;
+    const int rowbase = (lane & 1) | ((lane & 16) >> 2) | (lane & 8);
+    float mycorr[SMB][2];
+#pragma unroll
+    for (int i = 0; i < SMB; ++i)
+#pragma unroll
+      for (int t = 0; t < 2; ++t)
+        if ((lane & 6) == 0) {
+          const int idx = (wm * SM + i * 16 + rowbase + 2 * t) * WN + wn;
+          sRedM[idx] = m_run[i][t]; sRedS[idx] = l_run[i][t];
+        }
+    asm volatile("bar.sync 3, %0;" :: "r"(kConsThr));
+#pragma unroll
+    for (int i = 0; i < SMB; ++i)
+#pragma unroll
+      for (int t = 0; t < 2; ++t) {
+        const int idx0 = (wm * SM + i * 16 + rowbase + 2 * t) * WN;
+        float m = -CUDART_INF_F;
+#pragma unroll
+        for (int w = 0; w < WN; ++w) { const float y = sRedM[idx0 + w]; m = m > y ? m : y; }
+        float l = 0.f;
+#pragma unroll
+        for (int w = 0; w < WN; ++w) {
+          const float mw = sRedM[idx0 + w];
+          // Срез мог не увидеть НИ ОДНОГО ключа (причинная маска режет по столбцам): у него
+          // m = -inf и l = 0. exp2(-inf - m) даёт 0, но при m = -inf это -inf минус -inf = NaN,
+          // поэтому ветка, а не арифметика.
+          if (mw != -CUDART_INF_F) l += sRedS[idx0 + w] * exp2f(mw - m);
+        }
+        mycorr[i][t] = (m_run[i][t] == -CUDART_INF_F) ? 0.f : exp2f(m_run[i][t] - m);
+        m_run[i][t] = m; l_run[i][t] = l;
+      }
+    // Нормировка строки кладётся в sQsum: после мейнлупа он свободен, а новой разделяемой стоил бы
+    // занятости. Барьер -- чтобы никто не переписал sRedM/sRedS до того, как их дочитали выше.
+    asm volatile("bar.sync 3, %0;" :: "r"(kConsThr));
+    if (wn == 0 && (lane & 6) == 0)
+#pragma unroll
+      for (int i = 0; i < SMB; ++i)
+#pragma unroll
+        for (int t = 0; t < 2; ++t) {
+          const int row = r0 + i * 16 + rowbase + 2 * t;
+          sQsum[row] = (l_run[i][t] > 0.f) ? (kFmtMul * __frcp_rn(l_run[i][t])) : 0.f;
+          if (vslice == 0 && q0 + row < Sq)
+            Lse[q0 + row] = (l_run[i][t] > 0.f)
+                ? (m_run[i][t] * 0.6931471805599453f + __logf(l_run[i][t])) : -CUDART_INF_F;
+        }
+    // Свод O идёт ПОЛОСАМИ ПО ON СТОЛБЦОВ, а не всей шириной: площадка на WM*WN частиц полной
+    // ширины d -- это 128 КБ, а на полосу -- 32 КБ, и они влезают в буфер подачи (69.7 КБ),
+    // который освободился, когда везущие вышли. Полоса c принадлежит варпу wn==c, поэтому итог
+    // ложится в глобальную ровно тем же куском, что и у базового ядра.
+    float* sMrg = reinterpret_cast<float*>(sBuf);
+    constexpr int kPart = OM * ON;                     // частица одного варпа: строки x полоса
+    static_assert((long)WM * WN * kPart * sizeof(float) <= (long)2 * kBuf,
+                  "площадка свода не влезает в буфер подачи");
+    const int cbase0 = (lane & 2) | ((lane & 4) << 1);
+    const int tg = wn * 32 + lane;                     // 0..WN*32-1 внутри группы строк
+    float* my  = sMrg + (long)(wm * WN + wn) * kPart;
+    float* grp = sMrg + (long)(wm * WN) * kPart;
+#pragma unroll
+    for (int c = 0; c < WN; ++c) {                     // РАЗВЁРНУТ: индекс в o.acc обязан быть
+      asm volatile("bar.sync 3, %0;" :: "r"(kConsThr));  // константой, иначе накопитель уедет в LOCAL
+#pragma unroll
+      for (int i = 0; i < OM / 16; ++i)
+#pragma unroll
+        for (int jb = 0; jb < ON / 16; ++jb)
+#pragma unroll
+          for (int rg = 0; rg < 8; ++rg) {
+            const int sub = (rg >> 1) & 1;
+            const int row = i * 16 + rowbase + 2 * sub;
+            const int col = jb * 16 + cbase0 + (rg & 1) + 4 * ((rg >> 2) & 1);
+            my[row * ON + col] = o.acc[i][c * (ON / 16) + jb][rg] * mycorr[i][sub];
+          }
+      asm volatile("bar.sync 3, %0;" :: "r"(kConsThr));
+      // Сложение ведут ВСЕ WN варпов группы: соседние нити читают соседние слова (шаг между
+      // частицами kPart слов кратен 32), конфликта банков нет, и ни один варп не простаивает.
+      static_assert(kPart % (WN * 32) == 0, "полоса свода обязана делиться на нити группы");
+#pragma unroll
+      for (int it = 0; it < kPart / (WN * 32); ++it) {
+        const int e = tg + it * WN * 32;
+        float s = 0.f;
+#pragma unroll
+        for (int w = 0; w < WN; ++w) s += grp[w * kPart + e];
+        const int row = e / ON, col = e - row * ON;
+        if (q0 + r0 + row < Sq)
+          O[(long)(q0 + r0 + row) * o_sM + voff + c * ON + col] = __float2half(s * sQsum[r0 + row]);
+      }
+    }
+  } else {                                             // эпилог: O = acc / l, LSE = m + log(l)
     const int r0 = wm * OM;
     const int rowbase = (lane & 1) | ((lane & 16) >> 2) | (lane & 8);
     float inv[SMB][2];
@@ -883,7 +1219,7 @@ __shared__ float sRedS[BQ * WN * 2];
       // Точность не страдает: 256 -- степень двойки, kFmtMul * __frcp_rn(l) точно, и итоговое
       // округление одно и то же, что у эталона (256*acc)*(1/l).
       for (int t = 0; t < 2; ++t) inv[i][t] = (l_run[i][t] > 0.f) ? (kFmtMul * __frcp_rn(l_run[i][t])) : 0.f;
-    constexpr int OMB = OM / 16, ONB = ON / 16;
+    constexpr int OMB = OM / 16, ONB = ONo / 16;
     const int cbase0 = (lane & 2) | ((lane & 4) << 1);
 #pragma unroll
     for (int i = 0; i < OMB; ++i)
@@ -894,8 +1230,13 @@ __shared__ float sRedS[BQ * WN * 2];
           const int sub = (rg >> 1) & 1;
           const int row = i * 16 + rowbase + 2 * sub;
           const int col = j * 16 + cbase0 + (rg & 1) + 4 * ((rg >> 2) & 1);
-          if (q0 + r0 + row < Sq)   // смещение уже снято поплиточно -- здесь только нормировка
-            O[(long)(q0 + r0 + row) * o_sM + voff + wn * ON + col] = __float2half(o.acc[i][j][rg] * inv[i][sub]);
+          if (q0 + r0 + row < Sq) {  // смещение уже снято поплиточно -- здесь только нормировка
+            const float _v = o.acc[i][j][rg] * inv[i][sub];
+            // При расщеплении пишем СВОЙ (уже нормированный на свой l) выход среза в fp32 --
+            // ровно то, что ждёт `fwd_combine_splits_kernel`: он переваживает срезы по их LSE.
+            if (Op != nullptr) Op[(long)(q0 + r0 + row) * D + voff + wn * ON + col] = _v;
+            else O[(long)(q0 + r0 + row) * o_sM + voff + wn * ON + col] = __float2half(_v);
+          }
         }
     if ((lane & 6) == 0 && wn == 0 && vslice == 0) {   // LSE пишет только первый срез
 #pragma unroll
@@ -903,8 +1244,14 @@ __shared__ float sRedS[BQ * WN * 2];
 #pragma unroll
         for (int t = 0; t < 2; ++t) {
           const int row = r0 + i * 16 + rowbase + 2 * t;
-          if (q0 + row < Sq)
-            Lse[q0 + row] = (l_run[i][t] > 0.f) ? (m_run[i][t] * 0.6931471805599453f + __logf(l_run[i][t])) : -CUDART_INF_F;
+          if (q0 + row < Sq) {
+            const float _lse = (l_run[i][t] > 0.f)
+                ? (m_run[i][t] * 0.6931471805599453f + __logf(l_run[i][t])) : -CUDART_INF_F;
+            // LSE среза ОБЯЗАН быть записан даже у пустого среза: сводящее ядро читает его у
+            // ВСЕХ срезов и отбирает активные по isfinite. Незаписанная площадка -- мусор.
+            if (Lp != nullptr) Lp[q0 + row] = _lse;
+            else Lse[q0 + row] = _lse;
+          }
         }
     }
   }
@@ -913,3 +1260,5 @@ __shared__ float sRedS[BQ * WN * 2];
 
 }  // namespace fwd_ws
 }  // namespace fa2_sm70
+
+#undef FA2_KB_OF

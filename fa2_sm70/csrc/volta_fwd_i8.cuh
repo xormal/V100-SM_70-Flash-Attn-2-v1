@@ -103,6 +103,7 @@
 #define FA2_UNROLL_(n)   FA2_DO_PRAGMA(unroll n)
 #define FA2_UNROLL(n)    FA2_UNROLL_(n)
 #include <cuda_fp16.h>
+#include <cassert>
 #include <cstdint>
 #include <math_constants.h>
 #include "gemm/volta_warp_mma.h"
@@ -167,7 +168,26 @@ __global__ __launch_bounds__(WM * WN * 32, MINB) void volta_fwd_i8(
     int Sq, int Sk, float qk_scale, int kv_ratio, int causal_off,
     long q_sM, long q_sH, long q_sB, long k_sM, long k_sH, long k_sB,
     long o_sM, long o_sH, long o_sB, long lse_sH, long lse_sB, long ks_sH, long ks_sB,
-    long long* __restrict__ phase_acc = nullptr, int* __restrict__ sm_role = nullptr) {
+    long long* __restrict__ phase_acc = nullptr, int* __restrict__ sm_role = nullptr,
+    // Хвост-невидимка: paged-параметры ядра ролей (см. volta_fwd_ws.cuh, задача 163). Здесь НЕ
+    // используются -- нужны только чтобы тип функции совпадал с общим указателем kern в хосте.
+    const long* __restrict__ pageOff = nullptr, const long* __restrict__ pageScl = nullptr,
+    int pageHkv = 0,
+    // ХВОСТ РАЗРЕЖЕННОГО ОБХОДА -- здесь НЕ используется. Он есть только потому, что хост держит
+    // ОДИН указатель `kern` на оба ядра (это и ролевое, и вот это), а тип указателя обязан совпасть.
+    // Тихо разойтись подписям нельзя: компилятор ловит это присваиванием, и поймал.
+    const int* __restrict__ selIdx = nullptr, const int* __restrict__ selCnt = nullptr,
+    int selStride = 0, int selGroup = 1, int selSub = 0,
+    // ХВОСТ РАСЩЕПЛЕНИЯ ПО КЛЮЧАМ (записка 24) -- здесь тоже НЕ используется, причина та же:
+    // один указатель `kern` на оба ядра. Этот путь ОБЯЗАН зваться только с kSplit == 1;
+    // при kSplit > 1 он посчитал бы весь диапазон и написал в O вместо среза -- то есть
+    // тихо соврал бы. Утверждение ниже ловит это в отладочной сборке.
+    int kSplit = 1, float* __restrict__ Opart = nullptr, float* __restrict__ LSEpart = nullptr) {
+  (void)pageOff; (void)pageScl; (void)pageHkv;
+  (void)selIdx; (void)selCnt; (void)selStride; (void)selGroup; (void)selSub;
+  (void)Opart; (void)LSEpart;
+  assert(kSplit == 1);
+  (void)kSplit;
   constexpr int kWarps = WM * WN, PAD = 4;
   // Q ПОДАЁТСЯ КУСКАМИ ПО d, как и K: буфер BQ x DC вместо BQ x D -- минус 24 КБ, и это ровно то,
   // что осталось между 63 КБ и порогом двух резидентных блоков (48 КБ). Цена -- перечитывание Q на
@@ -370,18 +390,42 @@ FA2_UNROLL(FA2_DUNROLL)
       }
       // ПЕРЕКЛАДКА БЕЗ РАЗВОРОТА: байты кладутся как есть, вчетверо меньше и байт, и инструкций
       // записи. Разворот делает accumulate_bi8 -- В РЕГИСТРАХ и МЕЖДУ MMA (сдвиг фазы уже внутри).
-      constexpr int kRowStepK = (kWarps * 32) / (DC / 4);
+      // [ШИРОКАЯ ЗАГРУЗКА K, 27.08] Прежде нить брала ЧЕТЫРЕ байта (`uint32_t`), и аудит
+      // SASS показал: из 73 загрузок 65 -- ТРИДЦАТИДВУХБИТНЫЕ. Тело связывает КАНАЛ ВЫДАЧИ
+      // (`kanal_ili_cep.py`: ISSUE 100 %, ResMII 5842, RecMII 0), а канал выдачи лечится
+      // ровно СНЯТИЕМ ИНСТРУКЦИЙ. Шаг байтовой строки K кратен 16 (см. проверку выше в этом
+      // же теле), поэтому шестнадцатибайтовая загрузка ЗАКОННА: итераций вчетверо меньше,
+      // и вчетверо меньше адресной арифметики на тот же объём.
+      // Условие применимости проверяется на этапе сборки; иначе -- прежний путь по 4 байта.
+      constexpr bool _широкоK = (DC % 16 == 0) && (LDK8 % 16 == 0)
+                                && ((BK * DC / 16) % (kWarps * 32) == 0);
       const int rv = (kb + BK <= Sk) ? BK : (Sk - kb);
-      const int r0k = tid / (DC / 4), c0k = (tid % (DC / 4)) * 4;
-      const int8_t* pk = Kq + (long)(kb + r0k) * k_sM + dc + c0k;
-      int8_t* pdk = sK + r0k * LDK8 + c0k;
-      int rk = r0k;
+      if constexpr (_широкоK) {
+        constexpr int kRowStepK16 = (kWarps * 32) / (DC / 16);
+        const int r0k = tid / (DC / 16), c0k = (tid % (DC / 16)) * 16;
+        const int8_t* pk = Kq + (long)(kb + r0k) * k_sM + dc + c0k;
+        int8_t* pdk = sK + r0k * LDK8 + c0k;
+        int rk = r0k;
 #pragma unroll
-      for (int u = 0; u < (BK * DC / 4) / (kWarps * 32); ++u) {
-        uint32_t w = 0;
-        if (rk < rv) w = *reinterpret_cast<const uint32_t*>(pk);
-        *reinterpret_cast<uint32_t*>(pdk) = w;
-        pk += (long)kRowStepK * k_sM; pdk += kRowStepK * LDK8; rk += kRowStepK;
+        for (int u = 0; u < (BK * DC / 16) / (kWarps * 32); ++u) {
+          uint4 w = make_uint4(0, 0, 0, 0);
+          if (rk < rv) w = *reinterpret_cast<const uint4*>(pk);
+          *reinterpret_cast<uint4*>(pdk) = w;
+          pk += (long)kRowStepK16 * k_sM; pdk += kRowStepK16 * LDK8; rk += kRowStepK16;
+        }
+      } else {
+        constexpr int kRowStepK = (kWarps * 32) / (DC / 4);
+        const int r0k = tid / (DC / 4), c0k = (tid % (DC / 4)) * 4;
+        const int8_t* pk = Kq + (long)(kb + r0k) * k_sM + dc + c0k;
+        int8_t* pdk = sK + r0k * LDK8 + c0k;
+        int rk = r0k;
+#pragma unroll
+        for (int u = 0; u < (BK * DC / 4) / (kWarps * 32); ++u) {
+          uint32_t w = 0;
+          if (rk < rv) w = *reinterpret_cast<const uint32_t*>(pk);
+          *reinterpret_cast<uint32_t*>(pdk) = w;
+          pk += (long)kRowStepK * k_sM; pdk += kRowStepK * LDK8; rk += kRowStepK;
+        }
       }
       __syncthreads();
       s.template accumulate_bi8<DC>(sQ, LDQ, wm * SM, sK, LDK8, wn * SN, lane);   // Q -- текущий кусок

@@ -142,13 +142,15 @@ static void freeDev(Dev& d) {
 }
 
 // Одна точка перебора компоновки. varlen=false -> одна последовательность, сетка (NT, B*H/HPB).
-template <int WM, int WN, int HPB, int MINB, bool TRI>
+template <int WM, int WN, int HPB, int MINB, bool TRI, int DBUF = 0>
 struct Variant {
   static constexpr int LDA = BT + 4, LDB = DK + 16;
   using KT = void (*)(const __half*, const __half*, const __half*, const float*, const __half*,
                       __half*, __half*, const int*, const int*, int, int, int);
-  static KT kern() { return fa2_sm70::gdn::volta_gdn_chunk_wu<BT, DK, DV, WM, WN, HPB, MINB, TRI, int>; }
-  static size_t smem() { return (size_t)(BT * LDA + 2 * BT * LDB) * sizeof(__half); }
+  static KT kern() {
+    return fa2_sm70::gdn::volta_gdn_chunk_wu<BT, DK, DV, WM, WN, HPB, MINB, TRI, int, DBUF>;
+  }
+  static size_t smem() { return fa2_sm70::gdn::volta_gdn_wu_smem<BT, DK, DV, DBUF>(); }
   static void launch(const Dev& d, const Tensors& t, bool varlen) {
     static bool once = true;
     if (once) { CK(cudaFuncSetAttribute(kern(), cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem())); once = false; }
@@ -270,6 +272,20 @@ int main(int argc, char** argv) {
     ok &= check(t, d, "T=200 H=6 Hg=2 HPB=3, хвост 8") < 1e-3;
     freeDev(d);
   }
+  {   // ДВОЙНОЙ БУФЕР sA (DBUF=1, задача 192): та же боевая форма, ответ обязан совпасть
+    Tensors t; gen(t, 24, 8, {256}, true, 7);
+    Dev d; upload(t, d);
+    Variant<4, 2, 3, 1, true, 1>::launch(d, t, false); CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
+    ok &= check(t, d, "DBUF=1: T=256 H=24 Hg=8 HPB=3") < 1e-3;
+    freeDev(d);
+  }
+  {   // DBUF=1 на varlen с хвостами -- барьерная перестройка обязана пережить короткие чанки
+    Tensors t; gen(t, 12, 4, {100, 173}, true, 13);
+    Dev d; upload(t, d);
+    Variant<4, 2, 3, 1, true, 1>::launch(d, t, true); CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
+    ok &= check(t, d, "DBUF=1 varlen 100+173, H=12 Hg=4") < 1e-3;
+    freeDev(d);
+  }
   {   // varlen: две последовательности разной длины, обе с хвостом
     Tensors t; gen(t, 12, 4, {100, 173}, true, 13);
     Dev d; upload(t, d);
@@ -312,7 +328,16 @@ int main(int argc, char** argv) {
     const double ms = bench([&] { Q::launch(d, t, false); });                                   \
     rows.push_back({NAME, ms, Q::regs(), Q::blocksPerSm()});                                    \
   } while (0)
+#define POINTD(WMx, WNx, HPBx, MINBx, TRIx, NAME)                                               \
+  do {                                                                                          \
+    using Q = Variant<WMx, WNx, HPBx, MINBx, TRIx, 1>;                                          \
+    const double ms = bench([&] { Q::launch(d, t, false); });                                   \
+    rows.push_back({NAME, ms, Q::regs(), Q::blocksPerSm()});                                    \
+  } while (0)
   POINT(4, 2, 3, 2, true,  "4x2 HPB=3 TRI  MINB=2");
+  POINTD(4, 2, 3, 1, true, "4x2 HPB=3 TRI  DBUF MINB=1");
+  POINTD(4, 2, 3, 2, true, "4x2 HPB=3 TRI  DBUF MINB=2");
+  POINTD(2, 4, 3, 1, true, "2x4 HPB=3 TRI  DBUF MINB=1");
   POINT(4, 2, 3, 2, false, "4x2 HPB=3      MINB=2");
   POINT(2, 4, 3, 2, true,  "2x4 HPB=3 TRI  MINB=2");
   POINT(4, 2, 1, 2, true,  "4x2 HPB=1 TRI  MINB=2");

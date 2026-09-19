@@ -184,7 +184,9 @@ def main():
     Hv = v.shape[-2]
     v16 = v.to(torch.float16).contiguous()
     b16 = beta.to(torch.float16).contiguous()
-    Ai_o = ext.gdn_solve_tril(A_t, cu32, ci)
+    # [131] наш solve_tril читает Araw в fp16 -- тритоновский A_t (fp32) конвертируется на входе
+    A16 = A_t.to(torch.float16).contiguous()
+    Ai_o = ext.gdn_solve_tril(A16, cu32, ci)
     w_o, u_o = ext.gdn_wu(k16, v16, b16, g, Ai_o, cu32, ci)
     h_o, vn_o, _ = ext.gdn_h(k16, w_o, u_o, g, h0, cu32, co, NTv, True)
     steps_pairs = [
@@ -195,7 +197,7 @@ def main():
                                                  output_dtype=torch.float32),
          lambda: ext.gdn_kkt(k16, b16, g, cu32, ci, Hv)),
         ("solve_tril", lambda: solve_tril(A=A_t, cu_seqlens=cu, output_dtype=kn.dtype),
-         lambda: ext.gdn_solve_tril(A_t, cu32, ci)),
+         lambda: ext.gdn_solve_tril(A16, cu32, ci)),
         ("w,u", lambda: recompute_w_u_fwd(k=kn, v=v, beta=beta, A=Ai_t, g_cumsum=g, cu_seqlens=cu),
          lambda: ext.gdn_wu(k16, v16, b16, g, Ai_o, cu32, ci)),
         ("h", lambda: chunk_gated_delta_rule_fwd_h(k=kn, w=w_t, u=u_t, g=g, initial_state=h0,

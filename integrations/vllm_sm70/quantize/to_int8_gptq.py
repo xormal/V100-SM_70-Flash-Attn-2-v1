@@ -80,10 +80,21 @@ json.dump({"metadata": {"total_size": sum(os.path.getsize(os.path.join(DST, f))
            "weight_map": new_map},
           open(os.path.join(DST, "model.safetensors.index.json"), "w"), indent=1)
 cfg = json.load(open(os.path.join(SRC, "config.json")))
+# [ЭТОТ БЛОК СТОИЛ ЗАБОРА ИЗ ВОСКЛИЦАНИЙ. Первая редакция писала ТОЛЬКО `dynamic`, и притом по
+#  ИМЕНАМ ИЗ СЛЕПКА -- а движок к моменту вопроса "квантован ли модуль" уже СЛИЛ q/k/v в
+#  `qkv_proj`, а in_proj_a/b в `in_proj_ba`. Оба шаблона мимо, `modules_to_not_convert` нет вовсе:
+#  плотные модули строятся как квантованные, сервер ПОДНИМАЕТСЯ, ОБСЛУЖИВАЕТ и выдаёт `!!!!!!`.
+#  Нужны ОБА поля и `dynamic` -- по СЛИТЫМ именам. Проверка -- генерацией, не подъёмом.]
+SKIP_FUSED = [r".*visual.*", r".*\.self_attn\.qkv_proj$", r".*\.linear_attn\.in_proj_ba$",
+              r".*\.layers\.0\..*", r".*mtp.*", r"^lm_head$"]
+NOT_CONVERT = ["visual", "linear_attn.in_proj_b", "linear_attn.in_proj_a",
+               "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj",
+               "model.layers.0.", "model.language_model.layers.0.", "mtp"]
 cfg["quantization_config"] = {
     "quant_method": "gptq", "bits": BITS, "group_size": GROUP,
     "desc_act": False, "sym": False, "lm_head": False, "checkpoint_format": "gptq",
-    "dynamic": {f"-:{p}": {} for p in SKIP},
+    "dynamic": {f"-:{p}": {} for p in SKIP_FUSED},
+    "modules_to_not_convert": NOT_CONVERT,
 }
 json.dump(cfg, open(os.path.join(DST, "config.json"), "w"), indent=1)
 for f in os.listdir(SRC):

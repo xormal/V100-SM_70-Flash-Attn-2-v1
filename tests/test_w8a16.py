@@ -4,6 +4,15 @@
 # Fused GPTQ-int8 W8A16 GEMV: the packed kernel must equal an explicitly-unpacked fp16 matmul.
 # The reference is built by a DIFFERENT route (unpack to a dense tensor, then torch matmul), so a
 # shared misreading of the bit layout cannot pass both.  Run:  python tests/test_w8a16.py
+#
+# [ПОПРАВКА 16.08.2026 -- ТЕСТ УЗАКОНИВАЛ ДЕФЕКТ]
+# Эталон строился по СЫРОМУ нулю, то есть по условности GPTQ v2, -- ровно так же, как его читало
+# ядро. Два независимых на вид пути соглашались, будучи оба неверны для боевого слепка (формат
+# `gptq` = v1, где хранится z-1), и тест зелено проходил при систематической ошибке ~1.4 % на
+# каждом весе. Ломается это только внешним третейским путём: сверка с ЧУЖИМ ядром vLLM, где
+# условность задаётся флагом use_v2_format (см. benchmarks/bench_svoy_put.py -- там наше тело
+# при верной условности даёт 2.05e-4 против 1.18e-3 у чужого). Теперь гоняются ОБЕ условности,
+# и эталон строится по ТОЙ ЖЕ, что передана ядру.
 import os, sys, torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import fa2_sm70
@@ -26,15 +35,16 @@ for (K, N, G) in SH:
     q = ((qw.unsqueeze(1) >> sh.view(1, 4, 1)) & 0xFF).reshape(K, N).float()
     z = ((qz.unsqueeze(2) >> sh.view(1, 1, 4)) & 0xFF).reshape(K // G, N).float()
     g = torch.arange(K, device="cuda") // G
-    W = ((q - z[g]) * sc.float()[g]).half()
-    del q, z
-    for M in MS:
-        x = torch.randn(M, K, device="cuda", dtype=torch.float16) * 0.05
-        y = ext.w8a16_gemv(x, qw, qz, sc, G)
-        ref = x.float() @ W.float()
-        rel = ((y.float() - ref).norm() / ref.norm()).item()
-        good = rel < 2e-3; ok &= good
-        print(f"  K{K} N{N} G{G} M{M}: relL2={rel:.2e} {'OK' if good else 'FAIL'}")
-    del W; torch.cuda.empty_cache()
+    for v2 in (False, True):          # False = формат `gptq` (v1, хранится z-1); True = `gptq_v2`
+        W = ((q - (z if v2 else z + 1)[g]) * sc.float()[g]).half()
+        for M in MS:
+            x = torch.randn(M, K, device="cuda", dtype=torch.float16) * 0.05
+            y = ext.w8a16_gemv(x, qw, qz, sc, G, v2)
+            ref = x.float() @ W.float()
+            rel = ((y.float() - ref).norm() / ref.norm()).item()
+            good = rel < 2e-3; ok &= good
+            print(f"  K{K} N{N} G{G} M{M} v2={int(v2)}: relL2={rel:.2e} {'OK' if good else 'FAIL'}")
+        del W
+    del q, z; torch.cuda.empty_cache()
 
 print("W8A16:", "ALL OK" if ok else "FAILED"); assert ok
