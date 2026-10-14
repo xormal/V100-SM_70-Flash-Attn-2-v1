@@ -369,3 +369,17 @@ Tests: `python tests/run_all.py` (20 suites) or `pytest -q tests/`.
 - **`num_splits` is derived from a CTA count.** A chunk-size rule silently under-fills the machine.
 - **V100 clocks drift under load.** Any timing taken without `nvidia-smi -lgc`, and without the clock
   and power printed next to the result, is void.
+- **A growing `static` buffer must never be released while a CUDA graph may hold its address**
+  (2026-10-14).
+  * Workspaces kept in `static` tensors were reallocated when the batch grew, and the old tensor freed:
+    the split-K workspaces of `w8a16_gemv` and the per-head buffer `_Eg` of `sparse_select_rows`.
+  * Graphs captured at a smaller batch kept writing to the old address, and replays overwrote whatever
+    the allocator gave that memory next.
+  * In production this showed up as illegal memory accesses with Xid 31 MMU faults on both TP ranks,
+    and as a garbage draft token id (two int32 counts read as one int64).
+  * The rule: allocate for the largest batch up front, and push every retired tensor onto a `static`
+    keep-list.
+  * `tests/test_graph_keep.py` captures at a small batch, grows the buffer, places victim tensors and
+    replays. Before the fix 573,440 and 16,384 victim elements were overwritten; after it, 0.
+- **The decode selection holds at most 4096 key blocks per row.** That is 262,144 tokens at block 64;
+  anything wider fails a `TORCH_CHECK`. Callers have to fall back to dense decode above it.

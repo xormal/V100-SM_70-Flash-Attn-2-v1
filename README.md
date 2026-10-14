@@ -914,6 +914,9 @@ full occupancy, more when few heads under-fill the machine — §2.6).
 - `int4` decode is coarse (~10%); use `int8` for production, or `int4` only with the built-in top-1
   control point / per-channel scales.
 - The moment form (§2.5) is a documented prototype, not yet a kernel.
+- CUDA graphs: kernels that keep `static` workspaces never release them while a captured graph may hold
+  the address, a defect fixed on 2026-10-14 (`tests/test_graph_keep.py`, docs/KERNELS.md §6). The
+  decode key-tile selection holds at most 4096 key blocks per row.
 - GQA/MQA prefill is **native** (query head → KV head via `kv_head_ratio = H/Hkv`); no `repeat_interleave`.
   The backward is one-KV-per-query-head, so GQA/MQA grads expand K/V and reduce `dK/dV` back to `Hkv`.
 

@@ -669,6 +669,7 @@ e4m3 точно представимо в fp16** (знак тот же, поря
 ```bash
 python tests/run_all.py            # 20 наборов тестов -> "20/20"
 python tests/test_smoke_cpu.py     # проверка API без GPU
+python tests/test_graph_keep.py    # растущие static-буферы переживают CUDA-граф (GPU; правка 14.10, docs/KERNELS.ru.md §6)
 
 python benchmarks/bench_prefill.py     # префилл против SDPA; колонку без split-K меряет сам,
                                        # запуская себя дочерним процессом -- A/B одной командой
