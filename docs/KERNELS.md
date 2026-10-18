@@ -383,3 +383,16 @@ Tests: `python tests/run_all.py` (20 suites) or `pytest -q tests/`.
     replays. Before the fix 573,440 and 16,384 victim elements were overwritten; after it, 0.
 - **The decode selection holds at most 4096 key blocks per row.** That is 262,144 tokens at block 64;
   anything wider fails a `TORCH_CHECK`. Callers have to fall back to dense decode above it.
+- **`blk_mean_update` must refresh EVERY sub-block in its 64-slot slice, not just the first** (2026-10-18).
+  * After a decode step the slot list holds k+1 = 4 slots per request (MTP), so one slice of 64 slots
+    spans up to 16 requests. The kernel recomputed only the sub-block of the first slot; the mean keys of
+    sub-blocks that decode wrote for every other request in the batch stayed stale (zeros for a new one).
+    Without MTP it is the same, with 64 requests per slice instead of 16.
+  * Sparse decode then skipped those sub-blocks once they left the 512-token recent window. In production
+    (8 parallel chats, ~22-26K context) the model recalled a code it had written itself 1-2K tokens earlier
+    as 482910 instead of 482915: 5 of 16 correct. A live audit of the table found every sub-block of
+    batch positions 1..6 stale and position 0 clean.
+  * Fix behind `FA2SM70_BLKMEAN_ALL=1` (default 0 keeps the old behaviour bit for bit): recompute each
+    distinct sub-block in the slice, which is idempotent. Recall 16/16, audit 0 stale.
+  * `tests/test_blkmean_update.py`: decode 16x4 / mixed / padded slots against a torch reference. 7 of 33
+    touched sub-blocks are right before the fix, 33 of 33 after it.

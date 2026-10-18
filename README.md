@@ -917,6 +917,9 @@ full occupancy, more when few heads under-fill the machine — §2.6).
 - CUDA graphs: kernels that keep `static` workspaces never release them while a captured graph may hold
   the address, a defect fixed on 2026-10-14 (`tests/test_graph_keep.py`, docs/KERNELS.md §6). The
   decode key-tile selection holds at most 4096 key blocks per row.
+- Sparse decode: the mean-key table must be refreshed for every request in a decode batch, not only the
+  first one of each 64-slot slice. The fix sits behind `FA2SM70_BLKMEAN_ALL=1` (2026-10-18; default 0
+  keeps the old behaviour bit for bit; `tests/test_blkmean_update.py`, docs/KERNELS.md §6).
 - GQA/MQA prefill is **native** (query head → KV head via `kv_head_ratio = H/Hkv`); no `repeat_interleave`.
   The backward is one-KV-per-query-head, so GQA/MQA grads expand K/V and reduce `dK/dV` back to `Hkv`.
 
