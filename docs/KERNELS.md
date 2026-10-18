@@ -387,7 +387,9 @@ Tests: `python tests/run_all.py` (20 suites) or `pytest -q tests/`.
   * After a decode step the slot list holds k+1 = 4 slots per request (MTP), so one slice of 64 slots
     spans up to 16 requests. The kernel recomputed only the sub-block of the first slot; the mean keys of
     sub-blocks that decode wrote for every other request in the batch stayed stale (zeros for a new one).
-    Without MTP it is the same, with 64 requests per slice instead of 16.
+    Without MTP it is the same, with 64 requests per slice instead of 16. In a mixed step (decode rows
+    followed by a prefill chunk) the slices no longer start at sub-block boundaries, so some prompt
+    sub-blocks of the chunk were missed too (mixed slice in the test: 5 of 8 right).
   * Sparse decode then skipped those sub-blocks once they left the 512-token recent window. In production
     (8 parallel chats, ~22-26K context) the model recalled a code it had written itself 1-2K tokens earlier
     as 482910 instead of 482915: 5 of 16 correct. A live audit of the table found every sub-block of
